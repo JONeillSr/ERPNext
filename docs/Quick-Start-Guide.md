@@ -1,9 +1,10 @@
 # ERPNext Deployment - Quick Start Guide
 ## AWS Solutions LLC dba JT Custom Trailers
 
-**Author:** John O'Neill Sr. 
-
-**Date:** 02/17/2026
+**Author:** John O'Neill Sr.
+**Company:** Azure Innovators
+**Updated:** 05/15/2026
+**Script Version:** 1.1.0
 
 ---
 
@@ -11,95 +12,85 @@
 
 A complete ERPNext deployment and WooCommerce integration package:
 
-### 📁 Files Created
+### Files in this package
 
-1. **Deploy-ERPNextToAzure.ps1** - Azure VM deployment script
-2. **WooCommerce-Integration-Guide.md** - Complete integration documentation
-3. **Import-ERPNextCategories.ps1** - Category import automation
-4. **Data-Structure-Plan.md** - Detailed data migration plan
-5. **Quick-Start-Guide.md** - This file
+1. **Deploy-ERPNextToAzure.ps1** — End-to-end Azure VM deployment + ERPNext install
+2. **Import-ERPNextCategories.ps1** — Category import from WooCommerce Excel export
+3. **WooCommerce-Integration-Guide.md** — Full integration documentation
+4. **Data-Structure-Plan.md** — Detailed data migration plan
+5. **Quick-Start-Guide.md** — This file
+6. **README.md** — GitHub project overview
+7. **CHANGELOG.md** — Version history
+
+---
+
+## What's New in 1.1.0
+
+The deployment script is now **end-to-end**. You no longer need to manually SCP and SSH the install script onto the VM — that happens automatically via `Invoke-AzVMRunCommand`. You can still skip the install with `-SkipInstall` if you want to run it manually.
+
+Other improvements:
+- All passwords now dynamically generated (no hardcoded defaults in the install script)
+- Optional Azure Key Vault storage for secrets (`-UseKeyVault`)
+- Optional SSH key authentication (`-UseSSHKey`)
+- Optional source-IP restriction on NSG rules (`-AllowedSourceCIDR`)
+- Idempotent — safe to re-run if a deployment fails partway through
+- Node.js 20 LTS (was 18, now EOL)
+- Ubuntu 24.04 alignment throughout
 
 ---
 
 ## Quick Start Steps
 
-### Step 1: Deploy ERPNext to Azure (30-45 minutes)
+### Step 1: Deploy ERPNext to Azure (45-75 minutes total)
 
 ```powershell
-# From PowerShell 7.x with Azure modules installed
-
-# Connect to Azure
+# From PowerShell 7.2+ with Az modules installed
 Connect-AzAccount
 
-# Run deployment (customize parameters as desired)
-.\Deploy-ERPNextToAzure.ps1 -ResourceGroupName "JTC-prod-erpnext-eastus-rg" `
-                            -VMName "JTC-prod-erpnext-eastus-vm"`
-                            -Location "eastus" `
-                            -AdminUsername "jtadmin"
+# Basic run (defaults: D2s_v6, eastus, password auth, local JSON secrets)
+.\Deploy-ERPNextToAzure.ps1
 ```
 
-**What this does:**
-- Creates Azure Resource Group
-- Provisions Ubuntu 24.04 VM (Standard_D2s_v6)
-- Configures networking and firewall
-- Generates installation script
-- Saves connection details to `erpnext-connection-info.json`
-
-**You'll receive:**
-
-- VM public IP address
-- Admin credentials
-- SSH connection command
-- Installation script location
-
-### Step 2: Install ERPNext on VM (20-30 minutes)
-
-After deployment completes:
+**Production-grade run** (recommended):
 
 ```powershell
-# Get connection info
-$connInfo = Get-Content .\erpnext-connection-info.json | ConvertFrom-Json
-
-# Copy installation script to VM
-scp .\install-erpnext.sh "$($connInfo.AdminUsername)@$($connInfo.PublicIP):~/"
-
-# SSH into VM
-ssh "$($connInfo.AdminUsername)@$($connInfo.PublicIP)"
+.\Deploy-ERPNextToAzure.ps1 `
+    -ResourceGroupName "JTC-prod-erpnext-eastus-rg" `
+    -VMName "JTC-prod-erpnext-eastus-vm" `
+    -Location "eastus" `
+    -AdminUsername "jtadmin" `
+    -AllowedSourceCIDR "203.0.113.42/32" `
+    -UseSSHKey -SSHPublicKeyPath "$HOME\.ssh\id_rsa.pub" `
+    -UseKeyVault -KeyVaultName "JTC-prod-kv-eastus"
 ```
 
-On the VM:
-```bash
-# Make script executable
-chmod +x install-erpnext.sh
+**What this does (automatically):**
 
-# Run installation (takes 20-30 minutes)
-sudo ./install-erpnext.sh
-```
+1. Pre-flight checks (Az context, providers, region/size validation)
+2. Creates the Resource Group (if missing) with project tags
+3. Creates NSG, Public IP, VNet, Subnet, NIC (idempotent — skips if present)
+4. Generates secure random passwords (24-28 chars, mixed classes)
+5. Provisions Ubuntu 24.04 LTS VM with Premium SSD
+6. Stores secrets in Key Vault (or local JSON if not using Key Vault)
+7. Generates the install script
+8. Executes the install on the VM via Run Command (20-40 minutes)
+9. Returns a structured result object and writes `erpnext-connection-info.json`
 
-**Installation includes:**
-- MariaDB database
-- Redis cache
-- Nginx web server
-- Python dependencies
-- Node.js and Yarn
-- Frappe Framework
-- ERPNext application
-- HRMS module
-- Production setup
+**Output:** A connection-info file (or Key Vault secrets) containing public IP, admin user, ERPNext URL, and credentials.
 
-### Step 3: Access ERPNext
+### Step 2: Access ERPNext
 
-After installation completes:
+After the script finishes:
 
 ```
 URL: http://[YOUR-VM-IP]
-Username: JTCAdmin
-Password: Admin@JTCustom2026!
+Username: Administrator
+Password: (from erpnext-connection-info.json or Key Vault)
 ```
 
-**IMPORTANT:** Change the administrator password immediately!
+**IMPORTANT:** Change the Administrator password immediately on first login.
 
-### Step 4: Initial ERPNext Configuration (15 minutes)
+### Step 3: Initial ERPNext Configuration (15 minutes)
 
 1. **Company Setup Wizard:**
    - Company Name: AWS Solutions LLC dba JT Custom Trailers
@@ -109,215 +100,177 @@ Password: Admin@JTCustom2026!
    - Chart of Accounts: Standard USA
 
 2. **Create API Keys:**
-   - User → Administrator → API Access
-   - Generate API Key and Secret
-   - Save these securely for WooCommerce integration
+   - Click your user icon → My Settings → API Access → Generate Keys
+   - Save the Key and Secret immediately — the Secret is only displayed once
 
 3. **Basic Settings:**
-   - System Settings → Set timezone to America/New_York
-   - Set date format to MM/DD/YYYY
+   - System Settings → Time Zone: America/New_York
+   - Date Format: MM/DD/YYYY
    - Enable email notifications
 
-### Step 5: WooCommerce API Setup (10 minutes)
+### Step 4: WooCommerce API Setup (10 minutes)
 
 1. **In WordPress Admin:**
-   - WooCommerce → Settings → Advanced → REST API
-   - Add Key:
-     - Description: ERPNext Integration
-     - User: Your admin user
-     - Permissions: Read/Write
-   - Save Consumer Key and Secret
+   - WooCommerce → Settings → Advanced → REST API → Add Key
+   - Description: ERPNext Integration
+   - User: an admin user
+   - Permissions: Read/Write
+   - Save Consumer Key and Consumer Secret
 
-2. **Test API Connection:**
+2. **Test the connection from PowerShell:**
    ```powershell
-   # Test from PowerShell
    $apiUrl = "https://www.jtcustomtrailers.com/wp-json/wc/v3/products"
    $cred = "ck_YOUR_KEY:cs_YOUR_SECRET"
-   $encodedCred = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes($cred))
-   
-   $headers = @{
-       Authorization = "Basic $encodedCred"
-   }
-   
-   Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get
+   $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($cred))
+   Invoke-RestMethod -Uri $apiUrl -Headers @{ Authorization = "Basic $encoded" }
    ```
 
-### Step 6: Install WooCommerce Connector (5 minutes)
+### Step 5: Install WooCommerce Connector (5 minutes)
 
-SSH back into your ERPNext VM:
+SSH into the VM:
+
+```powershell
+$info = Get-Content .\erpnext-connection-info.json | ConvertFrom-Json
+ssh "$($info.AdminUsername)@$($info.PublicIP)"
+```
+
+On the VM:
 
 ```bash
 cd /home/jtadmin/frappe-bench
-
-# Get WooCommerce connector app
 bench get-app woocommerceconnector
-
-# Install on site
 bench --site jtcustomtrailers.local install-app woocommerceconnector
-
-# Restart
 bench restart
 ```
 
-### Step 7: Configure WooCommerce Integration (10 minutes)
+### Step 6: Configure WooCommerce Integration (10 minutes)
 
-In ERPNext:
+In ERPNext, search "WooCommerce Settings" and configure:
 
-1. **Search:** "WooCommerce Settings"
-2. **Configure:**
-   ```
-   Enable Sync: ✓
-   WooCommerce Server URL: https://www.jtcustomtrailers.com
-   API Consumer Key: [From WordPress]
-   API Consumer Secret: [From WordPress]
-   Enable Item Sync: ✓
-   Enable Order Sync: ✓
-   Warehouse: Main Warehouse
-   Company: JT Custom Trailers
-   ```
-3. **Save**
-
-### Step 8: Import Categories (15 minutes)
-
-Use the category import script:
-
-```powershell
-# Install required PowerShell module if not already installed
-Install-Module -Name ImportExcel -Force
-
-# Get API credentials from ERPNext
-$apiKey = "YOUR_API_KEY"
-$apiSecret = "YOUR_API_SECRET"
-
-# Run import
-.\Import-ERPNextCategories.ps1 -ProductCategoriesPath ".\ProductCategories.xlsx" `
-                                -ERPNextURL "http://YOUR-VM-IP" `
-                                -APIKey $apiKey `
-                                -APISecret $apiSecret
+```
+Enable Sync: ✓
+WooCommerce Server URL: https://www.jtcustomtrailers.com
+API Consumer Key: [from WordPress]
+API Consumer Secret: [from WordPress]
+Enable Item Sync: ✓
+Enable Order Sync: ✓
+Warehouse: Main Warehouse
+Company: JT Custom Trailers
 ```
 
-**Optional - Dry Run First:**
+### Step 7: Import Categories (15 minutes)
+
 ```powershell
-.\Import-ERPNextCategories.ps1 -ProductCategoriesPath ".\ProductCategories.xlsx" `
-                                -ERPNextURL "http://YOUR-VM-IP" `
-                                -APIKey $apiKey `
-                                -APISecret $apiSecret `
-                                -DryRun
+Install-Module -Name ImportExcel -Force  # If not already installed
+
+$apiKey = "YOUR_ERPNEXT_API_KEY"
+$apiSecret = "YOUR_ERPNEXT_API_SECRET"
+
+# Dry run first
+.\Import-ERPNextCategories.ps1 `
+    -ProductCategoriesPath .\ProductCategories.xlsx `
+    -ERPNextURL "http://YOUR-VM-IP" `
+    -APIKey $apiKey -APISecret $apiSecret `
+    -DryRun
+
+# Real import
+.\Import-ERPNextCategories.ps1 `
+    -ProductCategoriesPath .\ProductCategories.xlsx `
+    -ERPNextURL "http://YOUR-VM-IP" `
+    -APIKey $apiKey -APISecret $apiSecret
 ```
 
-### Step 9: Create Warehouses (5 minutes)
+### Step 8: Create Warehouses (5 minutes)
 
-In ERPNext:
+In ERPNext → Stock → Warehouse → New:
 
-1. **Stock → Warehouse → New**
-2. **Create:**
-   ```
-   Warehouse Name: Main Warehouse
-   Parent Warehouse: All Warehouses
-   Warehouse Type: Manufacturing
-   Address: 1214 Lake Avenue, Ashtabula, OH 44004
-   ```
-3. **Repeat for Showroom:**
-   ```
-   Warehouse Name: Showroom - Jefferson
-   Parent Warehouse: All Warehouses
-   Warehouse Type: Retail
-   Address: PO Box 348, Jefferson, OH 44047
-   ```
+```
+Warehouse Name:   Main Warehouse
+Parent:           All Warehouses
+Type:             Manufacturing
+Address:          1214 Lake Avenue, Ashtabula, OH 44004
 
-### Step 10: Test Product Sync (10 minutes)
+Warehouse Name:   Showroom - Jefferson
+Parent:           All Warehouses
+Type:             Retail
+Address:          PO Box 348, Jefferson, OH 44047
+```
 
-1. **Create Test Item in ERPNext:**
+### Step 9: Test Product Sync (10 minutes)
+
+1. **Create a test item in ERPNext:**
    ```
-   Item Code: TEST-SYNC-001
-   Item Name: Test Product Sync
-   Item Group: Interior
-   Standard Rate: 99.99
+   Item Code:       TEST-SYNC-001
+   Item Name:       Test Product Sync
+   Item Group:      Interior
+   Standard Rate:   99.99
    Show in Website: ✓
-   Opening Stock: 10 (in Main Warehouse)
+   Opening Stock:   10 (Main Warehouse)
    ```
 
-2. **Manually Trigger Sync:**
-   - WooCommerce Settings → Sync Now
-
-3. **Verify in WooCommerce:**
-   - Products → Check for TEST-SYNC-001
-
-4. **Clean Up:**
-   - Delete test item from both systems
+2. Trigger sync: WooCommerce Settings → Sync Now
+3. Verify the product appears in WooCommerce
+4. Delete the test item from both systems
 
 ---
 
-## Troubleshooting Common Issues
+## Troubleshooting
 
-### Issue: Can't connect to VM
+### Can't connect to the VM
 
-**Check:**
 ```powershell
-# Test if VM is running
-Get-AzVM -ResourceGroupName "rg-jtcustomtrailers-erpnext" -Name "vm-erpnext-prod"
-
-# Test network connectivity
+Get-AzVM -ResourceGroupName "JTC-prod-erpnext-eastus-rg" -Name "JTC-prod-erpnext-eastus-vm"
 Test-NetConnection -ComputerName YOUR-VM-IP -Port 22
 Test-NetConnection -ComputerName YOUR-VM-IP -Port 80
 ```
 
-**Solution:**
-- Verify NSG rules allow ports 22, 80, 443, 8000
-- Check VM is running
-- Verify public IP is correct
+Check:
+- NSG allows 22, 80, 443, 8000 from your source IP
+- VM is in `running` state
+- If you used `-AllowedSourceCIDR`, your current IP is within that range
 
-### Issue: ERPNext installation fails
+### ERPNext installation fails (Run Command path)
 
-**Check logs:**
-```bash
-# On the VM
-tail -f /var/log/syslog
-cd /home/jtadmin/frappe-bench
-bench logs
+```powershell
+# Retrieve the install log from the VM
+Invoke-AzVMRunCommand -ResourceGroupName "JTC-prod-erpnext-eastus-rg" `
+    -VMName "JTC-prod-erpnext-eastus-vm" `
+    -CommandId RunShellScript `
+    -ScriptString "tail -200 /var/log/erpnext-install.log"
 ```
 
-**Common fixes:**
+Common fixes (on VM):
+
 ```bash
-# Restart services
 sudo systemctl restart mariadb
-sudo systemctl restart redis
+sudo systemctl restart redis-server
 sudo supervisorctl restart all
 
-# Reinstall bench
+# Nuclear option — reinstall bench
 cd /home/jtadmin
 rm -rf frappe-bench
 bench init frappe-bench --frappe-branch version-15
 ```
 
-### Issue: WooCommerce API not connecting
+### WooCommerce API connection issues
 
-**Test API manually:**
 ```bash
-# From VM or local machine
-curl -u "ck_YOUR_KEY:cs_YOUR_SECRET" \
-     https://www.jtcustomtrailers.com/wp-json/wc/v3/products
+curl -u "ck_KEY:cs_SECRET" https://www.jtcustomtrailers.com/wp-json/wc/v3/products
 ```
 
-**Check:**
-- SSL certificate is valid on WordPress site
-- API keys are correct
-- Firewall allows outbound HTTPS from ERPNext VM
-- WordPress WooCommerce is active
+Check:
+- WordPress SSL certificate is valid
+- API keys correct, with Read/Write permission
+- VM outbound to HTTPS allowed (default Azure: yes)
 
-### Issue: Categories not importing
+### Category import errors
 
-**Check:**
 ```powershell
-# Verify Excel file is accessible
-Test-Path ".\ProductCategories.xlsx"
-
-# Verify ImportExcel module
+Test-Path .\ProductCategories.xlsx
 Get-Module -Name ImportExcel -ListAvailable
 
-# Test ERPNext API
 Invoke-RestMethod -Uri "http://YOUR-VM-IP/api/method/frappe.auth.get_logged_user" `
-                  -Headers @{Authorization = "token $apiKey`:$apiSecret"}
+    -Headers @{ Authorization = "token $apiKey`:$apiSecret" }
 ```
 
 ---
@@ -327,178 +280,87 @@ Invoke-RestMethod -Uri "http://YOUR-VM-IP/api/method/frappe.auth.get_logged_user
 - [ ] ERPNext accessible at VM IP
 - [ ] Administrator password changed
 - [ ] Company information configured
-- [ ] API keys generated and saved
+- [ ] API keys generated and stored securely
 - [ ] WooCommerce API connected
 - [ ] WooCommerce Connector installed
-- [ ] Categories imported (200+ item groups)
+- [ ] Categories imported (200+ Item Groups)
 - [ ] Warehouses created
 - [ ] Test product syncs successfully
-- [ ] Test order processes
-- [ ] Backups configured
-- [ ] SSL certificate installed (optional but recommended)
+- [ ] Test order processes end-to-end
+- [ ] Backups configured (`bench backup` cron or Azure Backup)
+- [ ] SSL certificate installed (Let's Encrypt or Azure App Gateway)
+- [ ] Source IP restriction in place (`-AllowedSourceCIDR`)
+- [ ] Secrets moved to Key Vault if not already
 
 ---
 
-## Next Steps
+## Security Recommendations
 
-### Immediate (This Week)
-1. Import product catalog from WooCommerce
-2. Verify inventory levels
-3. Enable order synchronization
-4. Train staff on basic ERPNext functions
+**Immediate:**
+- Change Administrator password
+- Create per-user accounts (don't use Administrator for daily work)
+- Enable two-factor authentication in ERPNext
 
-### Short Term (Next 2 Weeks)
-1. Set up supplier records
-2. Configure purchase workflows
-3. Create BOMs for standard trailer builds
-4. Implement work order tracking
+**Soon:**
+- Install SSL via Let's Encrypt: `sudo -H bench setup lets-encrypt jtcustomtrailers.local`
+- Configure automated backups to Azure Blob Storage
+- Rotate the credentials in `erpnext-connection-info.json` into Key Vault if you didn't use `-UseKeyVault`
 
-### Medium Term (Next Month)
-1. Generate custom reports
-2. Optimize sync schedules
-3. Implement quality checks
-4. Full manufacturing integration
-
-### Long Term (Next Quarter)
-1. Advanced analytics and dashboards
-2. Mobile app deployment
-3. Custom integrations (if needed)
-4. Process automation
+**Ongoing:**
+- Monthly `apt update && apt upgrade`
+- Monitor `/var/log/erpnext-install.log` and `bench logs`
+- Quarterly backup restore test
 
 ---
 
-## Important Files and Locations
+## Cost Estimate
 
-### On Your Local Machine
+| Item                       | Monthly |
+|----------------------------|---------|
+| Standard_D2s_v6 VM         | ~$70    |
+| 128 GB Premium SSD         | ~$20    |
+| Static Public IP           | ~$4     |
+| Bandwidth (typical)        | ~$5     |
+| **Total**                  | **~$100** |
+
+vs QuickBooks Online Plus ($100-$200/month + per-user): ERPNext is cost-equivalent at scale and includes inventory, manufacturing, CRM, and HR.
+
+---
+
+## Important Locations
+
+### On your local machine
 ```
-Deploy-ERPNextToAzure.ps1           - Deployment script
-install-erpnext.sh                  - Generated install script
-erpnext-connection-info.json        - Connection credentials
-Import-ERPNextCategories.ps1        - Category import script
-ProductCategories.xlsx              - Your category data
-WooCommerce-Integration-Guide.md    - Full integration docs
-Data-Structure-Plan.md              - Migration planning
+Deploy-ERPNextToAzure.ps1                  Deployment script
+install-erpnext.sh                          Generated install script
+erpnext-connection-info.json                Connection details (if not using Key Vault)
+Deploy-ERPNextToAzure_*.log                 Deployment logs
+Import-ERPNextCategories.ps1                Category import script
 ```
 
-### On Azure VM
+### On the Azure VM
 ```
-/home/jtadmin/frappe-bench/                    - Main ERPNext directory
-/home/jtadmin/frappe-bench/sites/              - Site configurations
-/home/jtadmin/frappe-bench/logs/               - Application logs
-/etc/nginx/                                    - Web server config
-/etc/supervisor/conf.d/                        - Process management
-```
-
-### Backup Locations
-```
-ERPNext Backups: /home/jtadmin/frappe-bench/sites/jtcustomtrailers.local/private/backups/
-Database Backups: /var/lib/mysql/
+/home/jtadmin/frappe-bench/                 Main ERPNext directory
+/home/jtadmin/frappe-bench/sites/           Site configurations
+/home/jtadmin/frappe-bench/logs/            Application logs
+/var/log/erpnext-install.log                Install log (this deployment)
+/etc/nginx/                                 Web server config
+/etc/supervisor/conf.d/                     Process management
 ```
 
 ---
 
 ## Getting Help
 
-### Documentation
-- **ERPNext Docs:** https://docs.erpnext.com/
-- **Frappe Framework:** https://frappeframework.com/docs
-- **WooCommerce API:** https://woocommerce.github.io/woocommerce-rest-api-docs/
+- ERPNext Docs: https://docs.erpnext.com/
+- Frappe Framework: https://frappeframework.com/docs
+- WooCommerce REST API: https://woocommerce.github.io/woocommerce-rest-api-docs/
+- ERPNext Forum: https://discuss.erpnext.com/
+- GitHub: https://github.com/JONeillSr/
 
-### Community Support
-- **ERPNext Forum:** https://discuss.erpnext.com/
-- **Frappe GitHub:** https://github.com/frappe/erpnext
-
-### Your Contact
-- **John O'Neill Sr.**
-- JONeillSr@jtcustomtrailers.com
-- (440) 813-6695
+**Contact:** John O'Neill Sr. — JONeillSr@jtcustomtrailers.com — (440) 813-6695
 
 ---
 
-## Security Recommendations
-
-### Immediate
-1. Change default ERPNext Administrator password
-2. Create user accounts (don't use Administrator for daily work)
-3. Configure firewall to restrict SSH access
-4. Enable two-factor authentication
-
-### Soon
-1. Install SSL certificate (Let's Encrypt)
-2. Set up automated backups to Azure Blob Storage
-3. Configure database backup encryption
-4. Implement IP whitelisting for admin access
-
-### Best Practices
-1. Regular security updates: `apt update && apt upgrade`
-2. Monitor logs for suspicious activity
-3. Use strong passwords (20+ characters)
-4. Regular backup testing (monthly)
-
----
-
-## Cost Estimate
-
-### Azure VM (Standard_D2s_v3)
-- **Compute:** ~$70/month (2 vCPU, 8GB RAM)
-- **Storage:** ~$10/month (128GB Premium SSD)
-- **Bandwidth:** ~$5/month (typical e-commerce traffic)
-- **Total:** ~$85/month
-
-### vs QuickBooks Online Plus
-- **QuickBooks:** $100-200/month + $4-20/user
-- **ERPNext:** FREE software + ~$85 infrastructure
-- **Savings:** $15-135/month + unlimited users
-
-### ROI
-- **Break-even:** Immediate (vs QuickBooks)
-- **Additional value:** Inventory, manufacturing, CRM included
-- **Scalability:** Same cost for 1 or 100 users
-
----
-
-## Success Metrics
-
-Track these to measure implementation success:
-
-### Week 1
-- [ ] ERPNext deployed and accessible
-- [ ] Categories imported
-- [ ] 10 test products syncing
-
-### Week 2
-- [ ] Full product catalog imported
-- [ ] Orders syncing from WooCommerce
-- [ ] Staff trained on basics
-
-### Month 1
-- [ ] 100% of online orders processed through ERPNext
-- [ ] Inventory accuracy >95%
-- [ ] First custom trailer work order completed
-
-### Month 3
-- [ ] Complete migration from QuickBooks
-- [ ] Manufacturing workflows optimized
-- [ ] Reporting dashboards created
-- [ ] Time savings: 10+ hours/week
-
----
-
-## Ready to Begin?
-
-You have everything you need to deploy ERPNext for JT Custom Trailers:
-
-1. **Infrastructure:** Azure deployment script
-2. **Installation:** Automated ERPNext setup
-3. **Integration:** WooCommerce connector ready
-4. **Data:** Category structure preserved
-5. **Documentation:** Complete guides and plans
-
-**Start with Step 1 above and work through the process. Each step builds on the previous one.**
-
-Good luck with your ERPNext implementation!
-
----
-
-**Quick Start Guide Version:** 1.0.0  
-**Last Updated:** 02/17/2026
+**Quick Start Guide Version:** 1.1.0
+**Last Updated:** 05/15/2026

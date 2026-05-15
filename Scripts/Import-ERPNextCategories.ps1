@@ -1,82 +1,167 @@
 <#
 .SYNOPSIS
-    Imports WooCommerce product categories from Excel into ERPNext Item Groups.
+    Imports WooCommerce product categories from Excel into ERPNext as Item Groups.
 
 .DESCRIPTION
-    This script reads the ProductCategories.xlsx file and creates the complete
-    category hierarchy in ERPNext as Item Groups. It maintains parent-child
-    relationships and includes all metadata.
+    Reads a WooCommerce category export (ProductCategories.xlsx) and creates the
+    complete category hierarchy in ERPNext as Item Groups via the REST API.
+
+    Key behaviors:
+        - Preserves parent-child relationships across the full tree
+        - Determines is_group from actual presence of children (not depth heuristic)
+        - Idempotent: skips Item Groups that already exist
+        - Dry-run mode prints the plan without making changes
+        - Throttles requests with a configurable delay
+        - Compatible with PowerShell 7 exception model (HttpResponseException)
 
 .PARAMETER ProductCategoriesPath
-    Path to the ProductCategories.xlsx file
+    Path to the ProductCategories.xlsx file. Each worksheet is processed as a
+    flat list of category rows with columns: term_id, name, slug, description,
+    parent, full_path.
 
 .PARAMETER ERPNextURL
-    Base URL of your ERPNext installation (e.g., http://your-erpnext-ip)
+    Base URL of your ERPNext installation. Examples:
+        http://20.85.123.45
+        https://erp.azureinnovators.com
 
 .PARAMETER APIKey
-    ERPNext API Key for authentication
+    ERPNext API Key. Generate via: User Account > API Access > Generate Keys.
 
 .PARAMETER APISecret
-    ERPNext API Secret for authentication
+    ERPNext API Secret returned alongside the API Key. Save this immediately;
+    ERPNext only displays it once at generation time.
 
 .PARAMETER DryRun
-    If specified, shows what would be created without actually creating it
+    Print the import plan without making any changes. Useful before a real run
+    against production.
+
+.PARAMETER ThrottleMilliseconds
+    Delay between API calls in milliseconds. Default: 100. Increase if you see
+    rate-limiting (HTTP 429) responses.
+
+.PARAMETER SkipSSLValidation
+    Skip TLS certificate validation. Use only for development/lab environments
+    with self-signed certificates. Default: disabled.
 
 .EXAMPLE
-    .\Import-ERPNextCategories.ps1 -ProductCategoriesPath ".\ProductCategories.xlsx" -ERPNextURL "http://20.85.123.45" -APIKey "abc123" -APISecret "xyz789"
+    PS> .\Import-ERPNextCategories.ps1 `
+            -ProductCategoriesPath .\ProductCategories.xlsx `
+            -ERPNextURL http://20.85.123.45 `
+            -APIKey abc123 -APISecret xyz789
+
+    Imports categories with default settings.
 
 .EXAMPLE
-    .\Import-ERPNextCategories.ps1 -ProductCategoriesPath ".\ProductCategories.xlsx" -ERPNextURL "http://20.85.123.45" -APIKey "abc123" -APISecret "xyz789" -DryRun
+    PS> .\Import-ERPNextCategories.ps1 `
+            -ProductCategoriesPath .\ProductCategories.xlsx `
+            -ERPNextURL http://20.85.123.45 `
+            -APIKey abc123 -APISecret xyz789 -DryRun
+
+    Shows what would be created without making changes.
+
+.INPUTS
+    None.
+
+.OUTPUTS
+    System.Management.Automation.PSCustomObject
+
+    Returns a summary object with Created, Skipped, and Failed counts.
 
 .NOTES
-    Author: John O'Neill Sr.
-    Company: Azure Innovators
-    Create Date: 02/17/2026
-    Version: 1.0.0
-    Change Date: 
-    Change Purpose:
+    Author:           John O'Neill Sr.
+    Company:          Azure Innovators
+    Create Date:      02/17/2026
+    Version:          1.1.0
+    Last Modified:    05/15/2026
+    GitHub:           https://github.com/JONeillSr/
+
+    PREREQUISITES:
+        - PowerShell 7.2 or later
+        - ImportExcel module (Install-Module -Name ImportExcel)
+        - A reachable ERPNext instance with API access enabled
+        - A user account with rights to create Item Groups
+
+    INPUT FILE FORMAT:
+        Each worksheet should contain rows with the following columns:
+            term_id      - WooCommerce term ID (numeric)
+            name         - Display name of the category
+            slug         - URL slug
+            description  - Optional category description
+            parent       - term_id of the parent category, or 0 for root
+            full_path    - Human-readable breadcrumb path (e.g., "Parts > Lights")
 
 .CHANGELOG
+    1.1.0 - 05/15/2026 - Reliability and correctness improvements
+        - is_group now derived from actual presence of children
+        - PS7-compatible exception handling for 404 (HttpResponseException)
+        - StrictMode-safe property access throughout
+        - Added ThrottleMilliseconds and SkipSSLValidation parameters
+        - Added retry-on-transient-error for API calls
+        - Returns a structured summary object
+        - Added structured file-based logging
+        - Expanded inline help
+
     1.0.0 - 02/17/2026 - Initial release
         - Parse ProductCategories.xlsx hierarchy
         - Create ERPNext Item Groups via REST API
         - Maintain parent-child relationships
         - Dry-run mode for testing
         - Progress reporting and error handling
+
+.LINK
+    https://github.com/JONeillSr/
+
+.LINK
+    https://docs.erpnext.com/docs/user/manual/en/stock/item-group
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)]
-    [ValidateScript({ Test-Path $_ })]
+    [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
     [string]$ProductCategoriesPath,
-    
+
     [Parameter(Mandatory)]
+    [ValidatePattern('^https?://.+')]
     [string]$ERPNextURL,
-    
+
     [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
     [string]$APIKey,
-    
+
     [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
     [string]$APISecret,
-    
+
     [Parameter()]
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    [Parameter()]
+    [ValidateRange(0, 5000)]
+    [int]$ThrottleMilliseconds = 100,
+
+    [Parameter()]
+    [switch]$SkipSSLValidation
 )
 
+#Requires -Version 7.2
 #Requires -Modules ImportExcel
 
-# Set strict mode
+# Strict mode but be deliberate about property access
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# Script configuration
-$ScriptVersion = "1.0.0"
+# Trim trailing slash from URL
+$ERPNextURL = $ERPNextURL.TrimEnd('/')
 
-Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+$ScriptVersion = "1.1.0"
+$LogFile = Join-Path $PSScriptRoot "Import-ERPNextCategories_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+Write-Host "===============================================================" -ForegroundColor Cyan
 Write-Host "  ERPNext Category Import Script v$ScriptVersion" -ForegroundColor Cyan
 Write-Host "  JT Custom Trailers" -ForegroundColor Cyan
-Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "  Log: $LogFile" -ForegroundColor DarkGray
+Write-Host "===============================================================" -ForegroundColor Cyan
 Write-Host ""
 
 if ($DryRun) {
@@ -87,68 +172,101 @@ if ($DryRun) {
 #region Helper Functions
 
 function Write-LogMessage {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$Message,
-        
-        [Parameter()]
-        [ValidateSet('Info', 'Success', 'Warning', 'Error')]
-        [string]$Level = 'Info'
+        [Parameter(Mandatory)] [string]$Message,
+        [Parameter()] [ValidateSet('Info','Success','Warning','Error','Debug')] [string]$Level = 'Info'
     )
-    
+
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp] [$Level] $Message"
     $color = switch ($Level) {
         'Info'    { 'White' }
         'Success' { 'Green' }
         'Warning' { 'Yellow' }
         'Error'   { 'Red' }
+        'Debug'   { 'DarkGray' }
     }
-    
-    Write-Host "[$timestamp] $Message" -ForegroundColor $color
+    Write-Host $line -ForegroundColor $color
+
+    try { Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue } catch { }
+}
+
+function Get-PropertyOrDefault {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object]$InputObject,
+        [Parameter(Mandatory)] [string]$PropertyName,
+        [Parameter()] $Default = $null
+    )
+
+    # StrictMode-safe property access on PSCustomObject
+    if ($null -eq $InputObject) { return $Default }
+    if ($InputObject.PSObject.Properties.Name -contains $PropertyName) {
+        $val = $InputObject.$PropertyName
+        if ($null -ne $val -and -not [string]::IsNullOrWhiteSpace([string]$val)) {
+            return $val
+        }
+    }
+    return $Default
 }
 
 function Invoke-ERPNextAPI {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$Endpoint,
-        
-        [Parameter()]
-        [ValidateSet('GET', 'POST', 'PUT', 'DELETE')]
-        [string]$Method = 'GET',
-        
-        [Parameter()]
-        [hashtable]$Body
+        [Parameter(Mandatory)] [string]$Endpoint,
+        [Parameter()] [ValidateSet('GET','POST','PUT','DELETE')] [string]$Method = 'GET',
+        [Parameter()] [hashtable]$Body,
+        [Parameter()] [int]$MaxRetries = 3
     )
-    
+
     $uri = "$ERPNextURL$Endpoint"
-    
     $headers = @{
         'Authorization' = "token $APIKey`:$APISecret"
         'Content-Type'  = 'application/json'
         'Accept'        = 'application/json'
     }
-    
+
     $params = @{
-        Uri     = $uri
-        Method  = $Method
-        Headers = $headers
+        Uri               = $uri
+        Method            = $Method
+        Headers           = $headers
+        UseBasicParsing   = $true
+        SkipHttpErrorCheck = $false
     }
-    
-    if ($Body) {
-        $params['Body'] = ($Body | ConvertTo-Json -Depth 10)
-    }
-    
-    try {
-        $response = Invoke-RestMethod @params
-        return $response
-    }
-    catch {
-        Write-LogMessage "API Error: $($_.Exception.Message)" -Level Error
-        Write-LogMessage "URI: $uri" -Level Error
-        if ($_.ErrorDetails) {
-            Write-LogMessage "Details: $($_.ErrorDetails.Message)" -Level Error
+    if ($SkipSSLValidation) { $params['SkipCertificateCheck'] = $true }
+    if ($Body) { $params['Body'] = ($Body | ConvertTo-Json -Depth 10 -Compress) }
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            return Invoke-RestMethod @params
         }
-        throw
+        catch {
+            $statusCode = $null
+
+            # PowerShell 7 throws Microsoft.PowerShell.Commands.HttpResponseException
+            if ($_.Exception.PSObject.Properties.Name -contains 'Response' -and $_.Exception.Response) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            } elseif ($_.Exception.PSObject.Properties.Name -contains 'StatusCode') {
+                $statusCode = [int]$_.Exception.StatusCode
+            }
+
+            # Don't retry on 4xx (except 429)
+            if ($statusCode -and $statusCode -ge 400 -and $statusCode -lt 500 -and $statusCode -ne 429) {
+                throw
+            }
+
+            if ($attempt -ge $MaxRetries) {
+                Write-LogMessage "API call failed after $MaxRetries attempts: $uri" -Level Error
+                throw
+            }
+
+            $backoff = [int][Math]::Pow(2, $attempt) * 500
+            Write-LogMessage "  Transient error (status=$statusCode), retry $attempt/$MaxRetries in ${backoff}ms..." -Level Debug
+            Start-Sleep -Milliseconds $backoff
+        }
     }
 }
 
@@ -156,28 +274,36 @@ function Test-ERPNextConnection {
     try {
         Write-LogMessage "Testing connection to ERPNext..." -Level Info
         $response = Invoke-ERPNextAPI -Endpoint "/api/method/frappe.auth.get_logged_user"
-        Write-LogMessage "Connected to ERPNext as: $($response.message)" -Level Success
+        $user = Get-PropertyOrDefault -InputObject $response -PropertyName 'message' -Default 'unknown'
+        Write-LogMessage "Connected to ERPNext as: $user" -Level Success
         return $true
     }
     catch {
-        Write-LogMessage "Failed to connect to ERPNext" -Level Error
+        Write-LogMessage "Failed to connect to ERPNext: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
 
 function Get-ERPNextItemGroup {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [string]$Name
+        [Parameter(Mandatory)] [string]$Name
     )
-    
+
     try {
-        $endpoint = "/api/resource/Item Group/$([System.Web.HttpUtility]::UrlEncode($Name))"
+        Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
+        $encodedName = [System.Web.HttpUtility]::UrlEncode($Name)
+        $endpoint = "/api/resource/Item Group/$encodedName"
         $response = Invoke-ERPNextAPI -Endpoint $endpoint
-        return $response.data
+        return Get-PropertyOrDefault -InputObject $response -PropertyName 'data' -Default $null
     }
     catch {
-        if ($_.Exception.Response.StatusCode -eq 404) {
+        # PS7: HttpResponseException carries the status code on .Response.StatusCode
+        $statusCode = $null
+        if ($_.Exception.PSObject.Properties.Name -contains 'Response' -and $_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+        if ($statusCode -eq 404) {
             return $null
         }
         throw
@@ -185,149 +311,162 @@ function Get-ERPNextItemGroup {
 }
 
 function New-ERPNextItemGroup {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [hashtable]$ItemGroup
+        [Parameter(Mandatory)] [hashtable]$ItemGroup
     )
-    
+
     if ($DryRun) {
-        Write-LogMessage "  [DRY RUN] Would create: $($ItemGroup.item_group_name)" -Level Warning
-        return @{ name = $ItemGroup.item_group_name }
+        $parentInfo = if ($ItemGroup.ContainsKey('parent_item_group')) { $ItemGroup['parent_item_group'] } else { '(none)' }
+        $isGroupInfo = if ($ItemGroup.ContainsKey('is_group')) { $ItemGroup['is_group'] } else { 0 }
+        Write-LogMessage "  [DRY RUN] Would create: $($ItemGroup['item_group_name'])  parent=$parentInfo  is_group=$isGroupInfo" -Level Warning
+        return @{ name = $ItemGroup['item_group_name'] }
     }
-    
+
     try {
         $endpoint = "/api/resource/Item Group"
         $response = Invoke-ERPNextAPI -Endpoint $endpoint -Method POST -Body $ItemGroup
-        Write-LogMessage "  Created: $($ItemGroup.item_group_name)" -Level Success
-        return $response.data
+        Write-LogMessage "  Created: $($ItemGroup['item_group_name'])" -Level Success
+        return Get-PropertyOrDefault -InputObject $response -PropertyName 'data' -Default $null
     }
     catch {
-        Write-LogMessage "  Failed to create: $($ItemGroup.item_group_name)" -Level Error
+        Write-LogMessage "  Failed to create: $($ItemGroup['item_group_name']) - $($_.Exception.Message)" -Level Error
         throw
     }
 }
 
 #endregion
 
-#region Main Script Logic
+#region Main Logic
 
 try {
-    # Test connection
-    if (-not (Test-ERPNextConnection)) {
-        exit 1
-    }
-    
-    # Load Excel file
-    Write-LogMessage "Loading ProductCategories.xlsx..." -Level Info
-    
-    # Get all sheet names
+    if (-not (Test-ERPNextConnection)) { exit 1 }
+
+    Write-LogMessage "Loading $ProductCategoriesPath..." -Level Info
+
     $excel = Open-ExcelPackage -Path $ProductCategoriesPath
-    $sheetNames = $excel.Workbook.Worksheets | Select-Object -ExpandProperty Name
+    $sheetNames = @($excel.Workbook.Worksheets | Select-Object -ExpandProperty Name)
     Close-ExcelPackage $excel
-    
-    Write-LogMessage "Found $($sheetNames.Count) category sheets" -Level Info
-    
-    # Process each sheet to build category hierarchy
-    $allCategories = @()
+
+    Write-LogMessage "Found $($sheetNames.Count) worksheet(s)." -Level Info
+
+    $allCategories = New-Object System.Collections.Generic.List[object]
     $categoryCount = 0
-    
+
     foreach ($sheetName in $sheetNames) {
         Write-LogMessage "Processing sheet: $sheetName" -Level Info
-        
-        # Import data from sheet
-        $categories = Import-Excel -Path $ProductCategoriesPath -WorksheetName $sheetName
-        
-        foreach ($category in $categories) {
-            if ($category.name) {
-                $categoryCount++
-                
-                $categoryObj = [PSCustomObject]@{
-                    term_id       = $category.term_id
-                    name          = $category.name
-                    slug          = $category.slug
-                    description   = $category.description
-                    parent_id     = $category.parent
-                    parent_name   = $null  # Will be resolved later
-                    full_path     = $category.full_path
-                    level         = ($category.full_path -split ' > ').Count - 1
-                }
-                
-                $allCategories += $categoryObj
-            }
+        $rows = @(Import-Excel -Path $ProductCategoriesPath -WorksheetName $sheetName)
+        foreach ($row in $rows) {
+            $name = Get-PropertyOrDefault -InputObject $row -PropertyName 'name'
+            if (-not $name) { continue }
+
+            $termId   = Get-PropertyOrDefault -InputObject $row -PropertyName 'term_id'
+            $parentId = Get-PropertyOrDefault -InputObject $row -PropertyName 'parent' -Default 0
+            $fullPath = Get-PropertyOrDefault -InputObject $row -PropertyName 'full_path' -Default $name
+            $description = Get-PropertyOrDefault -InputObject $row -PropertyName 'description'
+            $slug = Get-PropertyOrDefault -InputObject $row -PropertyName 'slug'
+
+            $level = ($fullPath -split ' > ').Count - 1
+
+            $allCategories.Add([PSCustomObject]@{
+                term_id      = $termId
+                name         = $name
+                slug         = $slug
+                description  = $description
+                parent_id    = $parentId
+                parent_name  = $null
+                full_path    = $fullPath
+                level        = $level
+            }) | Out-Null
+
+            $categoryCount++
         }
     }
-    
-    Write-LogMessage "Loaded $categoryCount total categories" -Level Success
-    
-    # Build parent name lookup
-    Write-LogMessage "Building parent relationships..." -Level Info
-    $categoryLookup = @{}
+
+    Write-LogMessage "Loaded $categoryCount total categories." -Level Success
+
+    # Build term_id -> category lookup
+    Write-LogMessage "Resolving parent relationships..." -Level Info
+    $categoryByTermId = @{}
     foreach ($cat in $allCategories) {
-        $categoryLookup[$cat.term_id] = $cat
+        if ($cat.term_id) {
+            $categoryByTermId[[string]$cat.term_id] = $cat
+        }
     }
-    
+
     # Resolve parent names
     foreach ($cat in $allCategories) {
-        if ($cat.parent_id -and $cat.parent_id -ne 0) {
-            $parent = $categoryLookup[$cat.parent_id]
-            if ($parent) {
-                $cat.parent_name = $parent.name
-            }
+        if ($cat.parent_id -and ([string]$cat.parent_id) -ne '0') {
+            $parent = $categoryByTermId[[string]$cat.parent_id]
+            if ($parent) { $cat.parent_name = $parent.name }
         }
     }
-    
-    # Sort by level (parents before children)
-    $sortedCategories = $allCategories | Sort-Object -Property level, term_id
-    
+
+    # Determine is_group from actual presence of children
+    $childCounts = @{}
+    foreach ($cat in $allCategories) {
+        if ($cat.parent_id -and ([string]$cat.parent_id) -ne '0') {
+            $key = [string]$cat.parent_id
+            if (-not $childCounts.ContainsKey($key)) { $childCounts[$key] = 0 }
+            $childCounts[$key]++
+        }
+    }
+
+    foreach ($cat in $allCategories) {
+        $key = [string]$cat.term_id
+        $isGroup = if ($childCounts.ContainsKey($key) -and $childCounts[$key] -gt 0) { 1 } else { 0 }
+        $cat | Add-Member -NotePropertyName 'is_group' -NotePropertyValue $isGroup -Force
+    }
+
+    # Sort: parents before children (by level, then name for stability)
+    $sortedCategories = $allCategories | Sort-Object -Property level, name
+
     Write-LogMessage "Creating Item Groups in ERPNext..." -Level Info
     Write-Host ""
-    
+
     $created = 0
     $skipped = 0
-    $failed = 0
-    
+    $failed  = 0
+
     foreach ($category in $sortedCategories) {
         try {
-            # Check if already exists
             $existing = Get-ERPNextItemGroup -Name $category.name
-            
             if ($existing) {
                 Write-LogMessage "  Skipped (exists): $($category.name)" -Level Warning
                 $skipped++
                 continue
             }
-            
-            # Prepare Item Group data
+
+            $parentName = if ($category.parent_name) { $category.parent_name } else { 'All Item Groups' }
+
             $itemGroup = @{
-                doctype         = "Item Group"
-                item_group_name = $category.name
-                parent_item_group = if ($category.parent_name) { $category.parent_name } else { "All Item Groups" }
-                is_group        = if ($category.level -lt 2) { 1 } else { 0 }
+                doctype           = 'Item Group'
+                item_group_name   = $category.name
+                parent_item_group = $parentName
+                is_group          = $category.is_group
             }
-            
-            # Add description if available
-            if ($category.description) {
-                $itemGroup['description'] = $category.description
+
+            if ($category.description) { $itemGroup['description'] = $category.description }
+
+            if ($PSCmdlet.ShouldProcess($category.name, 'Create Item Group')) {
+                New-ERPNextItemGroup -ItemGroup $itemGroup | Out-Null
+                $created++
             }
-            
-            # Create the item group
-            $result = New-ERPNextItemGroup -ItemGroup $itemGroup
-            $created++
-            
-            # Add a small delay to avoid overwhelming the API
-            Start-Sleep -Milliseconds 100
+
+            if ($ThrottleMilliseconds -gt 0) {
+                Start-Sleep -Milliseconds $ThrottleMilliseconds
+            }
         }
         catch {
-            Write-LogMessage "  Error processing: $($category.name) - $($_.Exception.Message)" -Level Error
+            Write-LogMessage "  Error processing $($category.name): $($_.Exception.Message)" -Level Error
             $failed++
         }
     }
-    
-    # Summary
+
     Write-Host ""
-    Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Green
-    Write-Host "  Import Complete!" -ForegroundColor Green
-    Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "===============================================================" -ForegroundColor Green
+    Write-Host "  Import Complete" -ForegroundColor Green
+    Write-Host "===============================================================" -ForegroundColor Green
     Write-Host ""
     Write-Host "Summary:" -ForegroundColor Cyan
     Write-Host "  Total Categories:  $categoryCount"
@@ -335,17 +474,20 @@ try {
     Write-Host "  Skipped (exist):   $skipped" -ForegroundColor Yellow
     Write-Host "  Failed:            $failed" -ForegroundColor $(if ($failed -gt 0) { 'Red' } else { 'White' })
     Write-Host ""
-    
-    if (-not $DryRun) {
-        Write-Host "Next Steps:" -ForegroundColor Cyan
-        Write-Host "  1. Log into ERPNext and verify Item Groups"
-        Write-Host "  2. Configure WooCommerce integration"
-        Write-Host "  3. Begin syncing products"
-        Write-Host ""
+    Write-Host "Log: $LogFile" -ForegroundColor DarkGray
+    Write-Host ""
+
+    return [PSCustomObject]@{
+        TotalCategories = $categoryCount
+        Created         = $created
+        Skipped         = $skipped
+        Failed          = $failed
+        DryRun          = $DryRun.IsPresent
+        LogFile         = $LogFile
     }
 }
 catch {
-    Write-LogMessage "Script failed: $_" -Level Error
+    Write-LogMessage "Script failed: $($_.Exception.Message)" -Level Error
     Write-LogMessage $_.ScriptStackTrace -Level Error
     exit 1
 }
