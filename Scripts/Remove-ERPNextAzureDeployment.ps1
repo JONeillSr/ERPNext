@@ -41,7 +41,19 @@
 
 .PARAMETER SubscriptionId
     Optional Azure subscription ID to target. If omitted, the current Az context
-    subscription is used.
+    subscription is used. Recommended in multi-tenant scenarios to avoid
+    accidentally targeting the wrong client.
+
+.PARAMETER TenantId
+    Optional Azure tenant (directory) ID to target. Useful when the same account
+    has access to multiple tenants (typical for consultants working with
+    multiple clients). When specified, the script switches to that tenant
+    before resolving the subscription.
+
+.PARAMETER SelectContext
+    If specified, presents an interactive picker listing all accessible
+    subscriptions across all tenants the account can see. The selected
+    subscription becomes the active context for the teardown.
 
 .PARAMETER Selective
     If specified, deletes only resources matching this deployment's naming
@@ -113,6 +125,21 @@
     Tears down a test RG, removing any delete locks that would otherwise block
     deletion.
 
+.EXAMPLE
+    PS> .\Remove-ERPNextAzureDeployment.ps1 -SelectContext -WhatIf
+
+    Presents an interactive subscription picker, then shows the teardown plan
+    without making changes. Useful when working across multiple client tenants.
+
+.EXAMPLE
+    PS> .\Remove-ERPNextAzureDeployment.ps1 `
+            -TenantId '11111111-2222-3333-4444-555555555555' `
+            -SubscriptionId '66666666-7777-8888-9999-000000000000' `
+            -Force
+
+    Explicitly targets a specific tenant and subscription regardless of the
+    active Az context.
+
 .INPUTS
     None.
 
@@ -125,7 +152,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      05/15/2026
-    Version:          1.0.0
+    Version:          1.1.4
     GitHub:           https://github.com/JONeillSr/
 
     PREREQUISITES:
@@ -146,6 +173,58 @@
         https://learn.microsoft.com/azure/key-vault/general/soft-delete-overview
 
 .CHANGELOG
+    1.1.4 - 05/15/2026 - Force flag now actually suppresses all prompts
+        - Despite -Force being passed to the script, Remove-AzResourceGroup
+          and other Az cmdlets were still showing their own confirmation
+          prompts mid-teardown. When -Force is supplied, the script now sets
+          $ConfirmPreference = 'None' and $PSDefaultParameterValues['*:Confirm']
+          = $false to suppress all downstream prompts globally
+        - Belt-and-suspenders -Confirm:$false on Remove-AzResourceGroup
+
+    1.1.3 - 05/15/2026 - Purge progress polling
+        - The previous 3-minute purge timeout was too aggressive; Key Vault
+          purge legitimately takes 10-15+ minutes in some regions
+        - Replaced blind cmdlet timeout with active polling of the
+          soft-deleted vault list. The vault disappearing from the list is
+          the definitive sign of success, regardless of whether the cmdlet
+          itself has returned yet
+        - Extended timeout to 20 minutes
+        - Periodic progress logs every 30 seconds so the user knows the
+          script is alive
+
+    1.1.2 - 05/15/2026 - Key Vault purge timeout protection
+        - Wrapped Remove-AzKeyVault -InRemovedState in a background job with
+          a 3-minute timeout. The cmdlet can hang silently when the Az token
+          cache has stale entries (multi-tenant consultant sessions) or when
+          the calling principal lacks Purge Soft-Deleted Vaults permission
+        - On timeout: surfaces clean remediation steps (Az session reset)
+          plus the Azure portal "Manage deleted vaults" workaround
+
+    1.1.1 - 05/15/2026 - Key Vault purge interactive-prompt fix
+        - Get-AzKeyVault -VaultName -InRemovedState requires -Location as a
+          mandatory parameter. The script previously omitted it, causing
+          PowerShell to interactively prompt the user mid-teardown. Now the
+          location is captured during pre-delete and reused for the
+          soft-deleted lookup. The orphaned-vault path uses the list-all
+          parameter set, which doesn't require Location.
+
+    1.1.0 - 05/15/2026 - Multi-tenant support for consultants
+        - Added -TenantId parameter to target a specific Azure AD tenant
+        - Added -SelectContext for interactive subscription picker
+        - Replaced Test-AzureConnection with richer Select-AzureContext function
+        - Teardown plan now shows tenant ID in addition to account and
+          subscription
+
+    1.0.1 - 05/15/2026 - Diagnostics and WhatIf fixes
+        - Fixed -WhatIf propagating into internal log writes (noisy "Add Content"
+          prompts during dry-run)
+        - When the target Resource Group isn't found in the current
+          subscription, the script now searches all accessible subscriptions
+          and reports where the RG actually lives, with the exact
+          -SubscriptionId command to re-run
+        - Teardown plan now shows the active Azure account and subscription
+          before any action, so wrong-context runs are obvious immediately
+
     1.0.0 - 05/15/2026 - Initial release
         - ResourceGroup and Selective teardown modes
         - Resource lock detection and optional removal
@@ -179,6 +258,12 @@ param(
     [string]$SubscriptionId,
 
     [Parameter()]
+    [string]$TenantId,
+
+    [Parameter()]
+    [switch]$SelectContext,
+
+    [Parameter()]
     [switch]$Selective,
 
     [Parameter()]
@@ -210,7 +295,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ScriptVersion = "1.0.0"
+$ScriptVersion = "1.1.4"
 $LogFile = Join-Path $PSScriptRoot "Remove-ERPNextAzureDeployment_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 Write-Host "===============================================================" -ForegroundColor Yellow
@@ -238,26 +323,98 @@ function Write-LogMessage {
         'Debug'   { 'DarkGray' }
     }
     Write-Host $line -ForegroundColor $color
-    try { Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue } catch { }
+    try { Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false } catch { }
 }
 
-function Test-AzureConnection {
+function Select-AzureContext {
+    <#
+    .SYNOPSIS
+        Resolves and validates the active Azure context for multi-tenant use.
+
+    .DESCRIPTION
+        Consultants frequently have access to several tenants and subscriptions
+        across client engagements. Get-AzContext returns whatever was last
+        selected, which is rarely what you want by default. This function:
+            - Verifies a connection exists
+            - Optionally switches tenant (-TenantId) and subscription (-SubscriptionId)
+            - Optionally offers an interactive picker (-Interactive)
+            - Returns the resolved context after switching
+            - Logs the resolved account, tenant, and subscription clearly
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()] [string]$TenantId,
+        [Parameter()] [string]$SubscriptionId,
+        [Parameter()] [switch]$Interactive
+    )
+
     try {
         $context = Get-AzContext -ErrorAction Stop
-        if (-not $context -or -not $context.Account) { throw "No active Azure context." }
+        if (-not $context -or -not $context.Account) {
+            throw "No active Azure context. Run Connect-AzAccount first."
+        }
 
-        if ($SubscriptionId -and $context.Subscription.Id -ne $SubscriptionId) {
-            Write-LogMessage "Switching subscription to: $SubscriptionId" -Level Info
-            Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
+        if ($TenantId -and $context.Tenant.Id -ne $TenantId) {
+            Write-LogMessage "Switching to tenant: $TenantId" -Level Info
+            $candidate = Get-AzSubscription -TenantId $TenantId -ErrorAction Stop |
+                         Where-Object { $_.State -eq 'Enabled' } |
+                         Select-Object -First 1
+            if (-not $candidate) {
+                throw "No enabled subscriptions found in tenant $TenantId for this account."
+            }
+            Set-AzContext -TenantId $TenantId -SubscriptionId $candidate.Id -ErrorAction Stop -WhatIf:$false | Out-Null
             $context = Get-AzContext
         }
 
-        Write-LogMessage "Connected as: $($context.Account.Id)" -Level Success
-        Write-LogMessage "Subscription:  $($context.Subscription.Name) ($($context.Subscription.Id))" -Level Info
+        if ($SubscriptionId -and $context.Subscription.Id -ne $SubscriptionId) {
+            Write-LogMessage "Switching to subscription: $SubscriptionId" -Level Info
+            Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop -WhatIf:$false | Out-Null
+            $context = Get-AzContext
+        }
+
+        if ($Interactive -and -not $SubscriptionId) {
+            $subs = @(Get-AzSubscription -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
+                      Where-Object { $_.State -eq 'Enabled' } |
+                      Sort-Object -Property @{Expression='TenantId'},@{Expression='Name'})
+
+            if ($subs.Count -gt 1) {
+                Write-Host ""
+                Write-Host "Available subscriptions:" -ForegroundColor Cyan
+                for ($i = 0; $i -lt $subs.Count; $i++) {
+                    $marker = if ($subs[$i].Id -eq $context.Subscription.Id) { '*' } else { ' ' }
+                    $line = ('  {0} [{1,2}] {2,-40} {3}  (tenant {4})' -f $marker, ($i+1), $subs[$i].Name, $subs[$i].Id, $subs[$i].TenantId)
+                    Write-Host $line
+                }
+                Write-Host ""
+                Write-Host "  * = current" -ForegroundColor DarkGray
+                Write-Host ""
+
+                do {
+                    $choice = Read-Host "Select subscription (1-$($subs.Count)) or press Enter to keep current"
+                    if ([string]::IsNullOrWhiteSpace($choice)) { break }
+                } until ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $subs.Count)
+
+                if (-not [string]::IsNullOrWhiteSpace($choice)) {
+                    $picked = $subs[[int]$choice - 1]
+                    Write-LogMessage "Selected: $($picked.Name) ($($picked.Id))" -Level Info
+                    Set-AzContext -TenantId $picked.TenantId -SubscriptionId $picked.Id -ErrorAction Stop -WhatIf:$false | Out-Null
+                    $context = Get-AzContext
+                }
+            }
+        }
+
+        Write-Host ""
+        Write-Host "ACTIVE AZURE CONTEXT" -ForegroundColor Cyan
+        Write-Host "  Account:        $($context.Account.Id)"
+        Write-Host "  Tenant:         $($context.Tenant.Id)"
+        Write-Host "  Subscription:   $($context.Subscription.Name) ($($context.Subscription.Id))"
+        Write-Host ""
+
+        Write-LogMessage "Resolved context: $($context.Account.Id) / $($context.Subscription.Name)" -Level Success
         return $context
     }
     catch {
-        Write-LogMessage "Not connected to Azure: $($_.Exception.Message)" -Level Error
+        Write-LogMessage "Failed to resolve Azure context: $($_.Exception.Message)" -Level Error
         Write-LogMessage "Run Connect-AzAccount before invoking this script." -Level Error
         return $null
     }
@@ -420,13 +577,16 @@ function Remove-KeyVaultWithOptionalPurge {
     Import-Module Az.KeyVault -ErrorAction Stop
 
     $results = @()
+    $vaultLocation = $null
 
     try {
         $vault = Get-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroup -ErrorAction SilentlyContinue
         if ($vault) {
+            # Capture the location BEFORE deletion - we'll need it to query the soft-deleted vault later
+            $vaultLocation = $vault.Location
             if ($PSCmdlet.ShouldProcess("Key Vault: $VaultName", 'Delete')) {
                 Remove-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroup -Force | Out-Null
-                Write-LogMessage "  Deleted Key Vault: $VaultName" -Level Success
+                Write-LogMessage "  Deleted Key Vault: $VaultName (was in $vaultLocation)" -Level Success
                 $results += @{ Status = 'Deleted'; Type = 'Key Vault'; Name = $VaultName }
             }
         } else {
@@ -440,13 +600,106 @@ function Remove-KeyVaultWithOptionalPurge {
 
     if ($PurgeKeyVault) {
         try {
-            $softDeleted = Get-AzKeyVault -VaultName $VaultName -InRemovedState -ErrorAction SilentlyContinue
+            # If we already know the location from the pre-delete query, use it directly.
+            # Otherwise, fall back to listing all soft-deleted vaults in the subscription
+            # and finding ours - slower but doesn't require interactive Location prompt.
+            if ($vaultLocation) {
+                $softDeleted = Get-AzKeyVault -VaultName $VaultName -Location $vaultLocation -InRemovedState -ErrorAction SilentlyContinue
+            } else {
+                $allDeleted = @(Get-AzKeyVault -InRemovedState -ErrorAction SilentlyContinue)
+                $softDeleted = $allDeleted | Where-Object { $_.VaultName -eq $VaultName } | Select-Object -First 1
+            }
+
             if ($softDeleted) {
                 Write-LogMessage "  Found soft-deleted Key Vault '$VaultName' in $($softDeleted.Location)." -Level Warning
                 if ($PSCmdlet.ShouldProcess("Soft-deleted Key Vault: $VaultName", 'Purge')) {
-                    Remove-AzKeyVault -VaultName $VaultName -Location $softDeleted.Location -InRemovedState -Force | Out-Null
-                    Write-LogMessage "  Purged Key Vault: $VaultName (name now available for reuse)" -Level Success
-                    $results += @{ Status = 'Purged'; Type = 'Key Vault (soft-deleted)'; Name = $VaultName }
+                    # Key Vault purge is a slow, multi-stage backend operation. In practice
+                    # we've observed it taking anywhere from 30 seconds to 15+ minutes,
+                    # especially in busy regions. The cmdlet itself doesn't time out and
+                    # can appear to hang while the operation is actually progressing.
+                    #
+                    # Strategy: kick off the purge in a background job, then actively poll
+                    # the soft-deleted vault list every 30 seconds. The vault disappearing
+                    # from that list is the definitive sign the purge succeeded, regardless
+                    # of whether the cmdlet has returned. We give it a generous timeout so
+                    # we don't kill a legitimately slow operation.
+
+                    $purgeTimeoutSeconds = 1200  # 20 minutes
+                    $pollIntervalSeconds = 30
+                    $purgeVaultLocation = $softDeleted.Location
+
+                    Write-LogMessage "  Initiating purge (timeout: $($purgeTimeoutSeconds / 60) min, polling every ${pollIntervalSeconds}s)..." -Level Info
+                    Write-LogMessage "  Note: Key Vault purge typically takes 1-15 minutes depending on region load." -Level Info
+
+                    $purgeJob = Start-Job -ScriptBlock {
+                        param($VaultName, $Location, $SubId, $TenantId)
+                        Import-Module Az.KeyVault -ErrorAction Stop
+                        Import-Module Az.Accounts -ErrorAction Stop
+                        # Az background jobs need their own context; copy from parent token cache
+                        try {
+                            $null = Set-AzContext -Tenant $TenantId -SubscriptionId $SubId -ErrorAction SilentlyContinue
+                        } catch { }
+                        Remove-AzKeyVault -VaultName $VaultName -Location $Location -InRemovedState -Force
+                    } -ArgumentList $VaultName, $purgeVaultLocation, (Get-AzContext).Subscription.Id, (Get-AzContext).Tenant.Id
+
+                    $deadline = (Get-Date).AddSeconds($purgeTimeoutSeconds)
+                    $purgeSucceeded = $false
+                    $elapsedSeconds = 0
+
+                    while ((Get-Date) -lt $deadline) {
+                        Start-Sleep -Seconds $pollIntervalSeconds
+                        $elapsedSeconds += $pollIntervalSeconds
+
+                        # Check if the vault is still soft-deleted
+                        try {
+                            $stillDeleted = Get-AzKeyVault -InRemovedState -ErrorAction SilentlyContinue |
+                                            Where-Object { $_.VaultName -eq $VaultName }
+                            if (-not $stillDeleted) {
+                                $purgeSucceeded = $true
+                                Write-LogMessage "  Purge confirmed after $([int]($elapsedSeconds / 60))m $($elapsedSeconds % 60)s (vault no longer in soft-deleted list)." -Level Success
+                                break
+                            }
+                        } catch {
+                            # Don't fail the loop on a transient polling error - keep waiting
+                            Write-LogMessage "  Polling check failed (transient): $($_.Exception.Message)" -Level Debug
+                        }
+
+                        # Also check whether the background job finished with an error
+                        if ($purgeJob.State -in 'Failed','Stopped') {
+                            Write-LogMessage "  Purge job exited with state: $($purgeJob.State)" -Level Warning
+                            break
+                        }
+
+                        Write-LogMessage "    Still purging... ($([int]($elapsedSeconds / 60))m $($elapsedSeconds % 60)s elapsed, job state: $($purgeJob.State))" -Level Info
+                    }
+
+                    # Clean up the job
+                    if ($purgeJob.State -eq 'Running') {
+                        Stop-Job -Job $purgeJob -ErrorAction SilentlyContinue
+                    }
+
+                    $jobError = $null
+                    try {
+                        Receive-Job -Job $purgeJob -ErrorAction Stop | Out-Null
+                    } catch {
+                        $jobError = $_.Exception.Message
+                    }
+                    Remove-Job -Job $purgeJob -Force -ErrorAction SilentlyContinue
+
+                    if ($purgeSucceeded) {
+                        Write-LogMessage "  Purged Key Vault: $VaultName (name now available for reuse)" -Level Success
+                        $results += @{ Status = 'Purged'; Type = 'Key Vault (soft-deleted)'; Name = $VaultName }
+                    } else {
+                        Write-LogMessage "  Purge did not complete within $([int]($purgeTimeoutSeconds / 60)) minutes." -Level Error
+                        if ($jobError) {
+                            Write-LogMessage "  Background job error: $jobError" -Level Error
+                        }
+                        Write-LogMessage "  Common causes and remediation:" -Level Warning
+                        Write-LogMessage "    Stale Az token cache: Disconnect-AzAccount; Clear-AzContext -Force; Connect-AzAccount" -Level Warning
+                        Write-LogMessage "    Missing permission: caller needs Microsoft.KeyVault/locations/deletedVaults/purge/action" -Level Warning
+                        Write-LogMessage "    Manual purge via portal: Key Vaults service > Manage deleted vaults > select > Purge" -Level Warning
+                        $results += @{ Status = 'Failed'; Type = 'Key Vault Purge'; Name = $VaultName; Error = "Did not complete within $([int]($purgeTimeoutSeconds / 60)) min" }
+                    }
                 }
             } else {
                 Write-LogMessage "  No soft-deleted vault named '$VaultName' to purge." -Level Debug
@@ -504,8 +757,18 @@ function Remove-LocalArtifacts {
 
 $allResults = @()
 
+# When the user invokes with -Force, suppress ALL downstream confirmation
+# prompts (including those from Az cmdlets like Remove-AzResourceGroup which
+# show their own "Are you sure?" prompt even when -Force is passed to them).
+# Setting these here means we don't have to remember -Confirm:$false on
+# every individual destructive call below.
+if ($Force) {
+    $ConfirmPreference = 'None'
+    $PSDefaultParameterValues['*:Confirm'] = $false
+}
+
 try {
-    $context = Test-AzureConnection
+    $context = Select-AzureContext -TenantId $TenantId -SubscriptionId $SubscriptionId -Interactive:$SelectContext
     if (-not $context) { exit 1 }
 
     # Production safety check
@@ -518,6 +781,9 @@ try {
     # Show plan before touching anything
     Write-Host ""
     Write-Host "TEARDOWN PLAN" -ForegroundColor Cyan
+    Write-Host "  Account:            $($context.Account.Id)"
+    Write-Host "  Tenant:             $($context.Tenant.Id)"
+    Write-Host "  Subscription:       $($context.Subscription.Name) ($($context.Subscription.Id))"
     Write-Host "  Mode:               $(if ($Selective) { 'Selective (per-resource)' } else { 'ResourceGroup (entire RG)' })"
     Write-Host "  Resource Group:     $ResourceGroupName"
     if ($Selective) {
@@ -533,13 +799,51 @@ try {
 
     # Verify RG exists
     $rg = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue
-    if (-not $rg -and -not $RemoveLocalArtifacts) {
-        Write-LogMessage "Resource Group '$ResourceGroupName' not found. Nothing to do." -Level Warning
-        if ($RemoveLocalArtifacts) {
-            # Fall through to clean up local files even if cloud RG is gone
-        } else {
+    if (-not $rg) {
+        Write-LogMessage "Resource Group '$ResourceGroupName' not found in current subscription." -Level Warning
+        Write-LogMessage "  Current context: $($context.Account.Id) -> $($context.Subscription.Name) ($($context.Subscription.Id))" -Level Info
+
+        # Search other subscriptions this account can see, in case the RG lives elsewhere
+        try {
+            Write-LogMessage "Searching other accessible subscriptions for '$ResourceGroupName'..." -Level Info
+            $otherSubs = @(Get-AzSubscription -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
+                Where-Object { $_.Id -ne $context.Subscription.Id -and $_.State -eq 'Enabled' })
+
+            $found = @()
+            foreach ($sub in $otherSubs) {
+                try {
+                    $null = Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop -WhatIf:$false
+                    $candidate = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue
+                    if ($candidate) {
+                        $found += [PSCustomObject]@{ Subscription = $sub.Name; SubscriptionId = $sub.Id; Location = $candidate.Location }
+                    }
+                } catch {
+                    Write-LogMessage "  Could not check subscription '$($sub.Name)': $($_.Exception.Message)" -Level Debug
+                }
+            }
+
+            # Restore original context regardless of search outcome
+            $null = Set-AzContext -SubscriptionId $context.Subscription.Id -ErrorAction SilentlyContinue -WhatIf:$false
+
+            if ($found.Count -gt 0) {
+                Write-LogMessage "Found '$ResourceGroupName' in $($found.Count) other subscription(s):" -Level Warning
+                foreach ($f in $found) {
+                    Write-LogMessage "  -> $($f.Subscription) ($($f.SubscriptionId))  Location: $($f.Location)" -Level Warning
+                }
+                Write-LogMessage "Re-run with -SubscriptionId to target the correct subscription, e.g.:" -Level Warning
+                Write-LogMessage "  .\Remove-ERPNextAzureDeployment.ps1 -SubscriptionId $($found[0].SubscriptionId) ..." -Level Warning
+                exit 4
+            } else {
+                Write-LogMessage "Resource Group not found in any accessible subscription." -Level Warning
+            }
+        } catch {
+            Write-LogMessage "Cross-subscription search failed: $($_.Exception.Message)" -Level Debug
+        }
+
+        if (-not $RemoveLocalArtifacts) {
             exit 0
         }
+        # Otherwise fall through to local artifact cleanup
     }
 
     # Confirmation gate (unless -Force or -WhatIf)
@@ -584,7 +888,7 @@ try {
 
             Write-LogMessage "Deleting Resource Group '$ResourceGroupName' (this may take several minutes)..." -Level Info
             if ($PSCmdlet.ShouldProcess("Resource Group: $ResourceGroupName", 'Delete')) {
-                $rgJob = Remove-AzResourceGroup -Name $ResourceGroupName -Force -AsJob
+                $rgJob = Remove-AzResourceGroup -Name $ResourceGroupName -Force -Confirm:$false -AsJob
                 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 
                 while ($rgJob.State -eq 'Running') {
@@ -614,11 +918,17 @@ try {
             } else {
                 Import-Module Az.KeyVault -ErrorAction Stop
                 try {
-                    $softDeleted = Get-AzKeyVault -VaultName $KeyVaultName -InRemovedState -ErrorAction SilentlyContinue
+                    # No location known here - use the list-all parameter set instead of the
+                    # single-vault parameter set which would prompt for Location.
+                    $allDeleted = @(Get-AzKeyVault -InRemovedState -ErrorAction SilentlyContinue)
+                    $softDeleted = $allDeleted | Where-Object { $_.VaultName -eq $KeyVaultName } | Select-Object -First 1
+
                     if ($softDeleted -and $PSCmdlet.ShouldProcess("Soft-deleted Key Vault: $KeyVaultName", 'Purge')) {
                         Remove-AzKeyVault -VaultName $KeyVaultName -Location $softDeleted.Location -InRemovedState -Force | Out-Null
-                        Write-LogMessage "Purged orphaned Key Vault: $KeyVaultName" -Level Success
+                        Write-LogMessage "Purged orphaned Key Vault: $KeyVaultName (was in $($softDeleted.Location))" -Level Success
                         $allResults += @{ Status = 'Purged'; Type = 'Key Vault (soft-deleted)'; Name = $KeyVaultName }
+                    } elseif (-not $softDeleted) {
+                        Write-LogMessage "No soft-deleted vault named '$KeyVaultName' found." -Level Debug
                     }
                 } catch {
                     Write-LogMessage "Failed to purge orphaned vault: $($_.Exception.Message)" -Level Error

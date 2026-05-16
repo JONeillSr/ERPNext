@@ -16,6 +16,7 @@ End-to-end PowerShell automation for deploying [ERPNext](https://erpnext.com/) o
 | **Deploy-ERPNextToAzure.ps1** | Provisions an Azure VM and installs ERPNext end-to-end |
 | **Remove-ERPNextAzureDeployment.ps1** | Tears down resources for clean re-testing |
 | **Import-ERPNextCategories.ps1** | Imports WooCommerce category hierarchy into ERPNext Item Groups |
+| **Select-AzureContext.ps1** | Helper for switching Azure contexts across tenants/subscriptions |
 | **Quick-Start-Guide.md** | Step-by-step deployment walkthrough |
 | **WooCommerce-Integration-Guide.md** | Full WooCommerce ↔ ERPNext integration reference |
 | **Data-Structure-Plan.md** | Data migration planning document |
@@ -144,6 +145,48 @@ Full walkthrough: [Quick-Start-Guide.md](Quick-Start-Guide.md).
 
 ---
 
+## Multi-tenant / consultant workflow
+
+If you're a consultant or MSP engineer with access to multiple Azure tenants and subscriptions, the scripts include several safeguards to keep client environments from getting mixed up:
+
+**Display context before action.** Every script prints the resolved account, tenant, and subscription in a banner before any resource operation. Wrong-tenant runs are obvious immediately.
+
+**Explicit targeting parameters:**
+
+```powershell
+# Pin to a specific tenant and subscription regardless of active context
+.\Deploy-ERPNextToAzure.ps1 `
+    -TenantId       '11111111-2222-3333-4444-555555555555' `
+    -SubscriptionId '66666666-7777-8888-9999-000000000000'
+```
+
+**Interactive subscription picker.** Pass `-SelectContext` to any of the deploy or teardown scripts and you'll get a numbered list of accessible subscriptions across all tenants — choose one before the script proceeds.
+
+**Multi-tenant safety gate (deploy script).** If your account has access to more than one subscription and you don't pin one with `-SubscriptionId` or `-SelectContext`, the deploy script refuses to run unless you pass `-ConfirmContext`. This prevents silently provisioning into the wrong client's tenant when your default context isn't what you think it is.
+
+**Cross-subscription RG search (teardown script).** If the teardown can't find the target Resource Group in the active subscription, it automatically searches all your accessible subscriptions and reports exactly which one contains the RG, with the precise `-SubscriptionId` command to re-run.
+
+**Standalone context helper:**
+
+```powershell
+# List all accessible subscriptions
+.\Select-AzureContext.ps1 -ListOnly
+
+# Interactive picker
+.\Select-AzureContext.ps1
+
+# Search by partial name
+.\Select-AzureContext.ps1 -SearchName 'JT Custom'
+
+# Switch and save for one-line restore later
+.\Select-AzureContext.ps1 -SubscriptionId 'f9c9501f-...' -SaveAs 'JTCustomTrailers-Prod'
+# Later: Select-AzContext -Name 'JTCustomTrailers-Prod'
+```
+
+---
+
+
+
 ## Architecture
 
 ```
@@ -183,6 +226,7 @@ Full walkthrough: [Quick-Start-Guide.md](Quick-Start-Guide.md).
 - **Default NSG is open to the public internet.** Always set `-AllowedSourceCIDR` for any non-throwaway deployment.
 - **Default authentication is password.** Use `-UseSSHKey` for production.
 - **Default secret storage is a local JSON file.** Use `-UseKeyVault` to keep secrets in Azure Key Vault.
+- **Key Vault requires role-assignment rights.** When `-UseKeyVault` is used, the running identity needs **Owner** or **User Access Administrator** on the Resource Group (not just Contributor) so the script can grant itself the *Key Vault Secrets Officer* role on the vault for data-plane access. The script detects insufficient permissions and provides clear remediation steps if this is missing.
 - The generated install script writes its log to `/var/log/erpnext-install.log` on the VM.
 - Default ERPNext admin user is `Administrator`. Change the password on first login and create per-user accounts for daily work.
 

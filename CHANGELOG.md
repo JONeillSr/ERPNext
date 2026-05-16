@@ -6,6 +6,141 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.3.8] - 2026-05-15
+
+### Fixed
+
+- **Key Vault probe secret name violated naming rules.** The write-probe secret introduced in 1.3.3 used underscores (`___erpnext-deploy-probe___`), but Key Vault secret names must match `^[0-9a-zA-Z-]+$` (alphanumerics and hyphens only). Renamed to `erpnext-deploy-probe-access`.
+
+---
+
+## [1.3.7] - 2026-05-15
+
+### Fixed
+
+- **Teardown's `-Force` flag wasn't fully honored.** Despite `-Force` being passed to `Remove-ERPNextAzureDeployment.ps1`, the underlying `Remove-AzResourceGroup` (and potentially other Az cmdlets) still showed their own `[Y/N/A/L/S]` confirmation prompts mid-teardown. The script ran but stalled at every prompt waiting for input — not what unattended `-Force` is supposed to mean.
+- When `-Force` is supplied, the script now sets `$ConfirmPreference = 'None'` and `$PSDefaultParameterValues['*:Confirm'] = $false` to suppress all downstream confirmation prompts globally, regardless of which cmdlet emits them. Added explicit `-Confirm:$false` to the `Remove-AzResourceGroup` call as well, belt-and-suspenders.
+
+---
+
+## [1.3.6] - 2026-05-15
+
+### Fixed
+
+- **Key Vault purge timeout was too aggressive.** Real-world testing showed `Remove-AzKeyVault -InRemovedState -Force` can legitimately take 10-15+ minutes to complete (Azure backend operation, no progress visibility). The previous 3-minute timeout from 1.3.5 would wrongly kill a successful in-flight operation.
+- **Replaced blind timeout with active polling.** The teardown now polls `Get-AzKeyVault -InRemovedState` every 30 seconds. When the target vault disappears from the soft-deleted list, the purge is confirmed successful — regardless of whether the underlying cmdlet has returned. Timeout extended to 20 minutes. Periodic progress messages every 30 seconds so the operator knows the script is alive.
+
+---
+
+## [1.3.5] - 2026-05-15
+
+### Fixed
+
+- **Teardown hung indefinitely on Key Vault purge.** `Remove-AzKeyVault -InRemovedState -Force` can silently hang when the Az token cache has stale entries from prior `Connect-AzAccount` calls (the same multi-tenant token-cache issue that affected the deploy script's Key Vault writes). Common in consultant workflows where multiple client tenants get authenticated in the same PowerShell session. The cmdlet doesn't time out on its own; it just sits forever waiting on something that never returns.
+- **Wrapped purge in a 3-minute timeout.** The purge now runs in a background job. If it doesn't complete in 180 seconds, the script aborts the job, reports failure, and surfaces the exact remediation steps (Az session reset, or the Azure portal "Manage deleted vaults" workaround).
+
+---
+
+## [1.3.4] - 2026-05-15
+
+### Fixed
+
+- **Teardown script hung on interactive `Location:` prompt during Key Vault purge.** `Get-AzKeyVault -VaultName <name> -InRemovedState` requires `-Location` as a mandatory parameter; without it, PowerShell silently prompts the user mid-teardown — easy to miss in a long-running script. The fix:
+  - Capture the vault's location during the pre-delete `Get-AzKeyVault` call and reuse it for the soft-deleted lookup
+  - In the orphaned-vault recovery path (where the RG was already deleted and we don't know the location), use the list-all-deleted parameter set instead and filter client-side by name. Slower but doesn't require `-Location`.
+
+---
+
+## [1.3.3] - 2026-05-15
+
+### Fixed
+
+- **Key Vault token-mismatch causing 403 after successful role assignment.** When the Az PowerShell session has had multiple `Connect-AzAccount` calls (common for consultants switching between client tenants), the token cache can return different tokens for different Key Vault cmdlets. The previous probe used `Get-AzKeyVaultSecret`, which would succeed under the user's identity, but the subsequent `Set-AzKeyVaultSecret` would authenticate as a different cached principal that hadn't been granted the role — producing a 403 with `Assignment: (not found)`.
+- **Probe rewritten as a real write.** `Test-KeyVaultSecretAccess` now writes (and immediately removes/purges) a throwaway probe secret using the exact same cmdlet path the real workload uses. If the probe passes, the real writes are guaranteed to pass.
+- **Self-healing for additional principals.** When a 403 reveals that an OID different from the one we just granted access to is actually making the call, the script extracts that OID from the error message and grants Key Vault Secrets Officer to it as well (up to 2 additional grants per run to prevent runaway role-grant loops).
+
+### Added
+
+- **Actionable failure remediation.** When all retries are exhausted, the error message now includes the exact PowerShell commands to clean the Az token cache (`Disconnect-AzAccount`, `Clear-AzContext -Force`, `Connect-AzAccount`) and re-run, rather than just reporting timeout.
+
+---
+
+## [1.3.2] - 2026-05-15
+
+### Fixed
+
+- **`New-AzKeyVault -EnableRbacAuthorization` removal in Az.KeyVault 6.0+.** Microsoft made a breaking change in Az.KeyVault 6.0.0 (October 2025): RBAC is now the default for new vaults, `-EnableRbacAuthorization` was removed, and `-DisableRbacAuthorization` was added as the inverse opt-out switch. The script now inspects the cmdlet's parameter set at runtime and uses the appropriate flag — or no flag at all if RBAC is already the default. This is more robust than version-string parsing across preview builds and forks.
+
+### Added
+
+- **Legacy vault detection.** When `Initialize-KeyVaultAccess` finds an existing vault using legacy access policies (RBAC not enabled), the script now surfaces a clear warning explaining that its role-assignment approach won't work and offering two remediation paths: migrate the vault to RBAC, or add an access policy manually.
+
+---
+
+## [1.3.1] - 2026-05-15
+
+### Fixed
+
+- **`Get-AzVMSize -Location` deprecation.** `Az.Compute 10.0.1` (released June 2025) deprecated the `-Location` parameter set on `Get-AzVMSize` and now throws "A parameter cannot be found that matches parameter name 'Location'." The deploy script now uses `Get-AzComputeResourceSku` (Microsoft's recommended replacement) for region/size validation.
+- **Region restriction detection.** When the new SKU query returns a size with regional restrictions (quota limits, zone restrictions), the script now surfaces this as a warning before attempting deployment, allowing the user to request quota increases proactively rather than waiting for the VM provisioning step to fail.
+- **Cross-tenant token warning noise.** `Get-AzSubscription` emits warnings when it tries to authenticate to tenants requiring fresh MFA — these are not failures, just side effects of enumerating across all tenants the account has ever touched. Wrapped subscription-enumeration calls in `-WarningAction SilentlyContinue` across all four scripts to quiet this noise.
+
+### Changed
+
+- **Size verification is now non-blocking on lookup errors.** If the SKU query fails (network, permissions, transient API error), the script proceeds with a warning rather than aborting the deployment. The actual VM provisioning step will surface the real error if the size is truly unavailable.
+
+---
+
+## [1.3.0] - 2026-05-15
+
+### Added
+
+- **Key Vault RBAC auto-configuration.** When `Deploy-ERPNextToAzure.ps1` is invoked with `-UseKeyVault`, the script now automatically assigns the **Key Vault Secrets Officer** role to the running identity at vault scope, then polls the Key Vault data plane until RBAC propagation completes before attempting to write secrets. Previously, the first `Set-AzKeyVaultSecret` call would fail with 403 because creating an RBAC-enabled vault does not implicitly grant the creator data-plane permissions.
+- **Principal type detection.** The script correctly resolves the AAD object ID for `User`, `ServicePrincipal`, and `ManagedService` (managed identity) account types — necessary because role assignments are made against object IDs, not UPNs.
+- **Pre-existing vault detection.** If `-KeyVaultName` points to a vault that already exists, the script tests data-plane access before doing anything else. If access is already in place, no role assignment is attempted. This supports the common pattern where an Owner pre-provisions vaults for delegated teams.
+- **Insufficient-permission diagnostics.** If the running identity lacks `Microsoft.Authorization/roleAssignments/write` (i.e., has only Contributor rather than Owner or User Access Administrator), the script detects this on role assignment failure and surfaces a clear remediation guide: have an Owner/UAA pre-grant access, pre-create the vault, or omit `-UseKeyVault`.
+- **Retry-with-backoff** on the actual `Set-AzKeyVaultSecret` call as a final safety net in case RBAC propagation completes between the access probe and the first write.
+
+### Changed
+
+- **`Set-VMKeyVaultSecret` is now retry-aware** with exponential backoff on 403 errors.
+- **`-UseKeyVault` parameter documentation** updated to specify the required Azure roles and the fallback path when permissions are insufficient.
+
+---
+
+## [1.2.1] - 2026-05-15
+
+### Changed
+
+- **Select-AzureContext.ps1 actionable errors.** When `-SearchName` or `-TenantId` finds no matches, the script now explains that the authenticated account has limited tenant visibility and shows the exact `Connect-AzAccount` commands needed to add another account or sign into a specific tenant. The previous "not found" error was technically correct but unhelpful — most failures of this kind are missing authentication, not missing resources.
+- **Select-AzureContext.ps1 single-subscription hint.** When `-ListOnly` shows only one accessible subscription, the script now includes guidance on authenticating additional accounts. Common for consultants who've signed into a client account and forgotten to add their own.
+
+---
+
+## [1.2.0] - 2026-05-15
+
+### Added
+
+- **Multi-tenant / consultant workflow.** All scripts now have first-class support for accounts with access to multiple Azure tenants and subscriptions — common for IT consultants and MSP engineers.
+- **`-TenantId` parameter** added to `Deploy-ERPNextToAzure.ps1` and `Remove-ERPNextAzureDeployment.ps1`. Switches to the specified Azure AD tenant before resolving subscription.
+- **`-SelectContext` parameter** on both deploy and teardown — presents an interactive numbered picker listing all accessible subscriptions across all tenants the account can see.
+- **`-ConfirmContext` safety gate** on `Deploy-ERPNextToAzure.ps1`. When the account has access to more than one subscription and neither `-SubscriptionId` nor `-SelectContext` is supplied, the deploy refuses to run unless `-ConfirmContext` is passed. Prevents silent deploys into the wrong client's tenant.
+- **`Select-AzureContext.ps1`** — new standalone helper for switching Azure contexts. Supports listing all accessible subscriptions, interactive selection, search by partial name, direct GUID switching, and saving named contexts for fast restore.
+- **Active context banner.** Every script now prints account, tenant, and subscription prominently before any resource operation, making wrong-context runs immediately visible.
+- **`Select-AzureContext` shared function** replaces the previous `Test-AzureConnection` in both deploy and teardown scripts. Handles tenant switching, subscription switching, and optional interactive picking in one place.
+
+---
+
+## [1.1.1] - 2026-05-15
+
+### Fixed
+
+- **Remove-ERPNextAzureDeployment.ps1 `-WhatIf` noise** — `-WhatIf` was propagating into internal `Add-Content` log writes, producing spurious "What if: Performing the operation Add Content" lines on every log call. Log writes are now explicitly excluded from WhatIf with `-WhatIf:$false`.
+- **Remove-ERPNextAzureDeployment.ps1 wrong-subscription diagnostics** — when the target Resource Group exists but lives in a different subscription than the active `Get-AzContext`, the script previously reported "not found" with no further guidance. It now searches across all accessible subscriptions and reports exactly which subscription contains the RG, with the precise `-SubscriptionId` command to re-run.
+- **Remove-ERPNextAzureDeployment.ps1 teardown plan visibility** — the teardown plan header now shows the active Azure account and subscription before any action is taken, making wrong-context runs immediately obvious.
+
+---
+
 ## [1.1.0] - 2026-05-15
 
 ### Added
@@ -85,5 +220,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+[1.3.8]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.7...v1.3.8
+[1.3.7]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.6...v1.3.7
+[1.3.6]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.5...v1.3.6
+[1.3.5]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.4...v1.3.5
+[1.3.4]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.3...v1.3.4
+[1.3.3]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.2...v1.3.3
+[1.3.2]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.1...v1.3.2
+[1.3.1]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.0...v1.3.1
+[1.3.0]: https://github.com/JONeillSr/erpnext-azure/compare/v1.2.1...v1.3.0
+[1.2.1]: https://github.com/JONeillSr/erpnext-azure/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/JONeillSr/erpnext-azure/compare/v1.1.1...v1.2.0
+[1.1.1]: https://github.com/JONeillSr/erpnext-azure/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/JONeillSr/erpnext-azure/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/JONeillSr/erpnext-azure/releases/tag/v1.0.0

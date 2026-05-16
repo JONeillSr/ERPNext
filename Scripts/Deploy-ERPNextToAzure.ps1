@@ -53,8 +53,26 @@
     significantly over time; 128 GB is a reasonable starting point.
 
 .PARAMETER SubscriptionId
-    Optional Azure subscription ID to target. If omitted, the current Az context
-    subscription is used.
+    Optional Azure subscription ID to target. If omitted and the account has
+    access to multiple subscriptions, you must also pass -SelectContext or
+    -ConfirmContext to acknowledge which subscription is active.
+
+.PARAMETER TenantId
+    Optional Azure tenant (directory) ID to target. Useful when the same
+    account has access to multiple tenants (typical for consultants working
+    with multiple clients). When specified, the script switches to that tenant
+    before resolving the subscription.
+
+.PARAMETER SelectContext
+    If specified, presents an interactive picker listing all accessible
+    subscriptions across all tenants the account can see. The selected
+    subscription becomes the active context for the deployment.
+
+.PARAMETER ConfirmContext
+    Explicit acknowledgment that the currently active Az context is the
+    intended target. Required when the account has access to multiple
+    subscriptions and neither -SubscriptionId nor -SelectContext is supplied.
+    This is a deliberate safety gate for multi-tenant consultants.
 
 .PARAMETER AllowedSourceCIDR
     Optional CIDR block to restrict SSH, HTTP, HTTPS, and ERPNext (8000) inbound
@@ -74,9 +92,20 @@
     ERPNext admin password) in an Azure Key Vault instead of writing them to
     a local JSON file. Requires -KeyVaultName.
 
+    The running identity needs the following Azure permissions:
+        - Contributor at Resource Group scope (to create the vault if needed)
+        - Owner or User Access Administrator at vault or RG scope (to assign
+          the Key Vault Secrets Officer role to itself for data-plane access).
+
+    If your account has only Contributor, have an Owner/UAA pre-create the
+    vault and pre-grant you Key Vault Secrets Officer, then re-run.
+
 .PARAMETER KeyVaultName
     Name of the Azure Key Vault to use when -UseKeyVault is specified. The vault
-    will be created if it does not exist.
+    will be created with RBAC authorization enabled if it does not exist. The
+    script will assign 'Key Vault Secrets Officer' to the running identity if
+    that role is not already in place, and wait for RBAC propagation before
+    writing secrets.
 
 .PARAMETER SkipInstall
     If specified, provisions the VM but skips ERPNext installation. Useful for
@@ -107,6 +136,21 @@
     Provisions infrastructure only. The install script is generated and saved
     locally for manual review/execution.
 
+.EXAMPLE
+    PS> .\Deploy-ERPNextToAzure.ps1 -TenantId '11111111-2222-3333-4444-555555555555' `
+            -SubscriptionId '66666666-7777-8888-9999-000000000000'
+
+    Multi-tenant scenario: explicitly target a specific client tenant and
+    subscription, regardless of the active Az context. Recommended for
+    consultants with access to multiple client environments.
+
+.EXAMPLE
+    PS> .\Deploy-ERPNextToAzure.ps1 -SelectContext
+
+    Presents an interactive picker showing all accessible subscriptions across
+    all tenants. Useful when you want to confirm visually which client
+    environment the deployment is targeting before any resources are created.
+
 .INPUTS
     None. This script does not accept pipeline input.
 
@@ -121,7 +165,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      02/17/2026
-    Version:          1.1.0
+    Version:          1.3.4
     Last Modified:    05/15/2026
     GitHub:           https://github.com/JONeillSr/
 
@@ -144,6 +188,64 @@
         - Total:                 ~$100/month
 
 .CHANGELOG
+    1.3.4 - 05/15/2026 - Probe secret name compliance
+        - Fixed: probe secret name contained underscores, which Key Vault
+          rejects. Secret names must match ^[0-9a-zA-Z-]+$ (alphanumerics
+          and hyphens only). Renamed to 'erpnext-deploy-probe-access'.
+
+    1.3.3 - 05/15/2026 - Key Vault token-mismatch self-healing
+        - Probe rewritten to use Set-AzKeyVaultSecret instead of
+          Get-AzKeyVaultSecret. Different Az.KeyVault cmdlets can authenticate
+          as different identities when the token cache has stale entries from
+          prior Connect-AzAccount calls, so testing the actual write operation
+          is the only reliable way to verify access
+        - On RBAC propagation failures, the script now extracts the calling
+          object ID from the 403 error message and grants the role to that
+          OID too (up to 2 additional grants per run)
+        - Detailed remediation guidance when all retries fail - tells the user
+          to Disconnect-AzAccount, Clear-AzContext, and reconnect cleanly
+
+    1.3.2 - 05/15/2026 - Az.KeyVault 6.x compatibility
+        - New-AzKeyVault parameter for RBAC is now selected at runtime based
+          on the installed module version (Az.KeyVault 6.0 replaced
+          -EnableRbacAuthorization with -DisableRbacAuthorization and made
+          RBAC the default)
+        - Detects existing vaults using legacy access policies and warns
+          that the script's RBAC-based access approach won't work without
+          either migrating the vault or adding an access policy manually
+
+    1.3.1 - 05/15/2026 - Az.Compute 10+ compatibility fixes
+        - Replaced Get-AzVMSize -Location (deprecated in Az.Compute 10.0.1)
+          with Get-AzComputeResourceSku
+        - Added detection of region-specific VM size restrictions
+        - Made size verification non-blocking on lookup errors (proceeds with
+          a warning instead of failing the deployment)
+        - Suppressed cross-tenant token acquisition warnings from
+          Get-AzSubscription when enumerating accessible subscriptions
+
+    1.3.0 - 05/15/2026 - Key Vault RBAC handling
+        - Key Vault now properly grants Key Vault Secrets Officer role to the
+          running identity on creation (previously failed with 403 on first
+          secret write)
+        - Polls for RBAC propagation before attempting secret writes
+        - Detects pre-existing vaults and verifies access rather than blindly
+          re-assigning roles
+        - Resolves principal object ID correctly for User, ServicePrincipal,
+          and ManagedService account types
+        - Detects insufficient permissions (Contributor-only) and provides
+          clear remediation guidance
+        - Retry-with-backoff on the actual Set-Secret call as a final
+          safety net for slow RBAC propagation
+
+    1.2.0 - 05/15/2026 - Multi-tenant support for consultants
+        - Added -TenantId parameter to target a specific Azure AD tenant
+        - Added -SelectContext for interactive subscription picker
+        - Added -ConfirmContext safety gate when multiple subscriptions are
+          accessible and none is pinned
+        - Active context (account, tenant, subscription) is now displayed
+          prominently before any resource operation
+        - Replaced Test-AzureConnection with richer Select-AzureContext function
+
     1.1.0 - 05/15/2026 - Major hardening and end-to-end automation
         - Added end-to-end installation via Invoke-AzVMRunCommand
         - Added Key Vault integration for secret storage
@@ -207,6 +309,15 @@ param(
     [string]$SubscriptionId,
 
     [Parameter()]
+    [string]$TenantId,
+
+    [Parameter()]
+    [switch]$SelectContext,
+
+    [Parameter()]
+    [switch]$ConfirmContext,
+
+    [Parameter()]
     [ValidatePattern('^(\d{1,3}\.){3}\d{1,3}(/\d{1,2})?$|^\*$')]
     [string]$AllowedSourceCIDR = '*',
 
@@ -238,7 +349,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # Script configuration
-$ScriptVersion = "1.1.0"
+$ScriptVersion = "1.3.4"
 $CompanyName = "JT Custom Trailers"
 $LogFile = Join-Path $PSScriptRoot "Deploy-ERPNextToAzure_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
@@ -283,30 +394,101 @@ function Write-LogMessage {
     }
 }
 
-function Test-AzureConnection {
+function Select-AzureContext {
+    <#
+    .SYNOPSIS
+        Resolves and validates the active Azure context for multi-tenant use.
+
+    .DESCRIPTION
+        Consultants frequently have access to several tenants and subscriptions
+        across client engagements. Get-AzContext returns whatever was last
+        selected, which is rarely what you want by default. This function:
+            - Verifies a connection exists
+            - Optionally switches tenant (-TenantId) and subscription (-SubscriptionId)
+            - Optionally offers an interactive picker (-Interactive)
+            - Returns the resolved context after switching
+            - Logs the resolved account, tenant, and subscription clearly
+    #>
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter()] [string]$TenantId,
+        [Parameter()] [string]$SubscriptionId,
+        [Parameter()] [switch]$Interactive
+    )
 
     try {
         $context = Get-AzContext -ErrorAction Stop
         if (-not $context -or -not $context.Account) {
-            throw "No active Azure context."
+            throw "No active Azure context. Run Connect-AzAccount first."
         }
 
+        # If caller specified a tenant and the active context isn't on it, switch.
+        if ($TenantId -and $context.Tenant.Id -ne $TenantId) {
+            Write-LogMessage "Switching to tenant: $TenantId" -Level Info
+            # Pick any subscription in that tenant to land on; user can refine with -SubscriptionId
+            $candidate = Get-AzSubscription -TenantId $TenantId -ErrorAction Stop |
+                         Where-Object { $_.State -eq 'Enabled' } |
+                         Select-Object -First 1
+            if (-not $candidate) {
+                throw "No enabled subscriptions found in tenant $TenantId for this account."
+            }
+            Set-AzContext -TenantId $TenantId -SubscriptionId $candidate.Id -ErrorAction Stop | Out-Null
+            $context = Get-AzContext
+        }
+
+        # If caller specified a subscription, switch to it.
         if ($SubscriptionId -and $context.Subscription.Id -ne $SubscriptionId) {
-            Write-LogMessage "Switching subscription to: $SubscriptionId" -Level Info
+            Write-LogMessage "Switching to subscription: $SubscriptionId" -Level Info
             Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop | Out-Null
             $context = Get-AzContext
         }
 
-        Write-LogMessage "Connected as: $($context.Account.Id)" -Level Success
-        Write-LogMessage "Subscription:  $($context.Subscription.Name) ($($context.Subscription.Id))" -Level Info
-        return $true
+        # Interactive picker - only when no subscription was specified and multiple are available.
+        if ($Interactive -and -not $SubscriptionId) {
+            $subs = @(Get-AzSubscription -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
+                      Where-Object { $_.State -eq 'Enabled' } |
+                      Sort-Object -Property @{Expression='TenantId'},@{Expression='Name'})
+
+            if ($subs.Count -gt 1) {
+                Write-Host ""
+                Write-Host "Available subscriptions:" -ForegroundColor Cyan
+                for ($i = 0; $i -lt $subs.Count; $i++) {
+                    $marker = if ($subs[$i].Id -eq $context.Subscription.Id) { '*' } else { ' ' }
+                    $line = ('  {0} [{1,2}] {2,-40} {3}  (tenant {4})' -f $marker, ($i+1), $subs[$i].Name, $subs[$i].Id, $subs[$i].TenantId)
+                    Write-Host $line
+                }
+                Write-Host ""
+                Write-Host "  * = current" -ForegroundColor DarkGray
+                Write-Host ""
+
+                do {
+                    $choice = Read-Host "Select subscription (1-$($subs.Count)) or press Enter to keep current"
+                    if ([string]::IsNullOrWhiteSpace($choice)) { break }
+                } until ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $subs.Count)
+
+                if (-not [string]::IsNullOrWhiteSpace($choice)) {
+                    $picked = $subs[[int]$choice - 1]
+                    Write-LogMessage "Selected: $($picked.Name) ($($picked.Id))" -Level Info
+                    Set-AzContext -TenantId $picked.TenantId -SubscriptionId $picked.Id -ErrorAction Stop | Out-Null
+                    $context = Get-AzContext
+                }
+            }
+        }
+
+        Write-Host ""
+        Write-Host "ACTIVE AZURE CONTEXT" -ForegroundColor Cyan
+        Write-Host "  Account:        $($context.Account.Id)"
+        Write-Host "  Tenant:         $($context.Tenant.Id)"
+        Write-Host "  Subscription:   $($context.Subscription.Name) ($($context.Subscription.Id))"
+        Write-Host ""
+
+        Write-LogMessage "Resolved context: $($context.Account.Id) / $($context.Subscription.Name)" -Level Success
+        return $context
     }
     catch {
-        Write-LogMessage "Not connected to Azure: $($_.Exception.Message)" -Level Error
+        Write-LogMessage "Failed to resolve Azure context: $($_.Exception.Message)" -Level Error
         Write-LogMessage "Run Connect-AzAccount before invoking this script." -Level Error
-        return $false
+        return $null
     }
 }
 
@@ -393,20 +575,358 @@ function New-NSGRuleSet {
     return $configs
 }
 
+function Get-CurrentPrincipalObjectId {
+    <#
+    .SYNOPSIS
+        Returns the AAD object ID of the currently authenticated principal.
+
+    .DESCRIPTION
+        RBAC role assignments require the principal's object ID, not the
+        UPN/email. This function resolves it correctly across the three
+        common cases:
+            - Interactive user (UPN)
+            - Service principal (ApplicationId)
+            - Managed identity (ApplicationId)
+
+        Returns a hashtable with ObjectId, PrincipalType, and DisplayName.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $context = Get-AzContext -ErrorAction Stop
+        $accountType = $context.Account.Type
+        $accountId   = $context.Account.Id
+
+        switch ($accountType) {
+            'User' {
+                $user = Get-AzADUser -UserPrincipalName $accountId -ErrorAction SilentlyContinue
+                if (-not $user) {
+                    # Some directories require ObjectId/SignInName lookup instead
+                    $user = Get-AzADUser -Mail $accountId -ErrorAction SilentlyContinue
+                }
+                if (-not $user) {
+                    throw "Could not resolve user '$accountId' in directory."
+                }
+                return @{
+                    ObjectId      = $user.Id
+                    PrincipalType = 'User'
+                    DisplayName   = $user.DisplayName
+                }
+            }
+            { $_ -in 'ServicePrincipal','ManagedService' } {
+                $sp = Get-AzADServicePrincipal -ApplicationId $accountId -ErrorAction SilentlyContinue
+                if (-not $sp) {
+                    throw "Could not resolve service principal '$accountId'."
+                }
+                return @{
+                    ObjectId      = $sp.Id
+                    PrincipalType = 'ServicePrincipal'
+                    DisplayName   = $sp.DisplayName
+                }
+            }
+            default {
+                throw "Unsupported principal type '$accountType'. Supported: User, ServicePrincipal, ManagedService."
+            }
+        }
+    }
+    catch {
+        Write-LogMessage "Failed to resolve current principal: $($_.Exception.Message)" -Level Error
+        throw
+    }
+}
+
+function Test-KeyVaultSecretAccess {
+    <#
+    .SYNOPSIS
+        Tests whether the current principal can WRITE secrets to the vault.
+
+    .DESCRIPTION
+        Attempts to write (and immediately delete) a throwaway probe secret.
+        This is more reliable than a read probe because:
+            1. It exercises the same code path as the real workload
+            2. Set and Get can authenticate as different identities under
+               some Az.KeyVault token-cache scenarios - testing the actual
+               operation we'll perform avoids false positives
+            3. RBAC role propagation can complete for Get before Set
+
+        Returns a hashtable with:
+            Granted    : $true if access works
+            ObjectId   : extracted from 403 error if access is denied (the
+                         object ID the call was actually authenticated as)
+            Error      : the underlying error message if denied
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$VaultName
+    )
+
+    $probeName = 'erpnext-deploy-probe-access'
+    $probeValue = ConvertTo-SecureString -String 'probe' -AsPlainText -Force
+
+    try {
+        # WRITE probe: same code path as real secret writes
+        Set-AzKeyVaultSecret -VaultName $VaultName -Name $probeName -SecretValue $probeValue -ErrorAction Stop | Out-Null
+        # Clean up the probe (best-effort)
+        try {
+            Remove-AzKeyVaultSecret -VaultName $VaultName -Name $probeName -Force -ErrorAction SilentlyContinue | Out-Null
+            # Also purge so it doesn't sit in soft-delete state
+            Remove-AzKeyVaultSecret -VaultName $VaultName -Name $probeName -InRemovedState -Force -ErrorAction SilentlyContinue | Out-Null
+        } catch { }
+        return @{ Granted = $true; ObjectId = $null; Error = $null }
+    }
+    catch {
+        $msg = $_.Exception.Message
+        if ($msg -match 'Forbidden|does not have secrets|AuthorizationFailed|Caller is not authorized') {
+            # The 403 response often contains the OID the call was authenticated as.
+            # Pattern: oid=<guid>
+            $extractedOid = $null
+            if ($msg -match 'oid=([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})') {
+                $extractedOid = $Matches[1]
+            }
+            return @{ Granted = $false; ObjectId = $extractedOid; Error = $msg }
+        }
+        # Anything else - re-raise so the caller can decide
+        throw
+    }
+}
+
+function Grant-KeyVaultSecretsOfficer {
+    <#
+    .SYNOPSIS
+        Assigns the Key Vault Secrets Officer role to a principal at vault scope.
+
+    .DESCRIPTION
+        Key Vault Secrets Officer (b86a8fe4-44ce-4948-aee5-eccb2c155cd7) is
+        the minimum role for setting and reading secrets on an RBAC-enabled
+        vault. Idempotent - skips if the assignment already exists.
+
+        Requires the running identity to have Microsoft.Authorization/
+        roleAssignments/write at the vault or higher scope. Owner and User
+        Access Administrator have this; Contributor does NOT.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$VaultResourceId,
+        [Parameter(Mandatory)] [string]$PrincipalObjectId,
+        [Parameter(Mandatory)] [string]$PrincipalType,
+        [Parameter()]          [string]$RoleDefinitionName = 'Key Vault Secrets Officer'
+    )
+
+    try {
+        $existing = Get-AzRoleAssignment -Scope $VaultResourceId `
+            -ObjectId $PrincipalObjectId `
+            -RoleDefinitionName $RoleDefinitionName `
+            -ErrorAction SilentlyContinue
+
+        if ($existing) {
+            Write-LogMessage "  Role '$RoleDefinitionName' already assigned." -Level Info
+            return $true
+        }
+
+        Write-LogMessage "  Assigning '$RoleDefinitionName' to principal $PrincipalObjectId..." -Level Info
+        New-AzRoleAssignment -Scope $VaultResourceId `
+            -ObjectId $PrincipalObjectId `
+            -RoleDefinitionName $RoleDefinitionName `
+            -ErrorAction Stop | Out-Null
+
+        Write-LogMessage "  Role assignment created." -Level Success
+        return $true
+    }
+    catch {
+        $msg = $_.Exception.Message
+        if ($msg -match 'AuthorizationFailed|does not have authorization') {
+            Write-LogMessage "Cannot assign roles - your account lacks Microsoft.Authorization/roleAssignments/write." -Level Error
+            Write-LogMessage "Required Azure role: Owner or User Access Administrator (Contributor is not sufficient)." -Level Error
+            Write-LogMessage "Workaround options:" -Level Error
+            Write-LogMessage "  1. Have an Owner/UAA pre-grant 'Key Vault Secrets Officer' on the vault to your account" -Level Error
+            Write-LogMessage "  2. Have an Owner/UAA pre-create the vault and grant access, then re-run with -KeyVaultName" -Level Error
+            Write-LogMessage "  3. Omit -UseKeyVault and accept local JSON secret storage for this deployment" -Level Error
+        } else {
+            Write-LogMessage "Role assignment failed: $msg" -Level Error
+        }
+        throw
+    }
+}
+
+function Initialize-KeyVaultAccess {
+    <#
+    .SYNOPSIS
+        Ensures the running identity can write secrets to the target vault.
+
+    .DESCRIPTION
+        Creates the vault if missing, resolves the running principal's
+        object ID, assigns Key Vault Secrets Officer if not already present,
+        and waits for RBAC propagation by polling the data plane until
+        access is confirmed (or until timeout).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$VaultName,
+        [Parameter(Mandatory)] [string]$ResourceGroup,
+        [Parameter(Mandatory)] [string]$Location,
+        [Parameter()]          [int]$PropagationTimeoutSeconds = 180
+    )
+
+    # Get or create vault
+    $kv = Get-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroup -ErrorAction SilentlyContinue
+    if (-not $kv) {
+        Write-LogMessage "  Creating Key Vault '$VaultName'..." -Level Info
+
+        # Az.KeyVault parameter naming changed in 6.0.0:
+        #   <  6.0:  -EnableRbacAuthorization (off by default, must opt in)
+        #   >= 6.0:  -DisableRbacAuthorization (on by default, must opt out)
+        # Inspect the cmdlet's actual parameter set at runtime rather than checking
+        # a version number - more robust across preview builds and custom forks.
+        $newVaultParams = @{
+            Name              = $VaultName
+            ResourceGroupName = $ResourceGroup
+            Location          = $Location
+            ErrorAction       = 'Stop'
+        }
+
+        $cmdInfo = Get-Command -Name New-AzKeyVault -ErrorAction Stop
+        $params  = $cmdInfo.Parameters.Keys
+
+        if ($params -contains 'EnableRbacAuthorization') {
+            # Older module - must explicitly opt in to RBAC
+            $newVaultParams['EnableRbacAuthorization'] = $true
+            Write-LogMessage "  Using legacy -EnableRbacAuthorization (Az.KeyVault < 6.0)." -Level Debug
+        } elseif ($params -contains 'DisableRbacAuthorization') {
+            # Modern module - RBAC is default, just don't disable it
+            Write-LogMessage "  Using default RBAC (Az.KeyVault >= 6.0)." -Level Debug
+        } else {
+            # Unknown shape - try without the flag and hope for the best
+            Write-LogMessage "  Az.KeyVault version has neither known RBAC flag; using defaults." -Level Warning
+        }
+
+        $kv = New-AzKeyVault @newVaultParams
+        Write-LogMessage "  Vault created." -Level Success
+    } else {
+        Write-LogMessage "  Vault already exists. Verifying access..." -Level Info
+
+        # If the existing vault is not RBAC-enabled, our role-assignment approach won't work
+        if ($kv.PSObject.Properties.Name -contains 'EnableRbacAuthorization' -and -not $kv.EnableRbacAuthorization) {
+            Write-LogMessage "  WARNING: Existing vault uses legacy access policies, not RBAC." -Level Warning
+            Write-LogMessage "  This script grants access via RBAC roles. You may need to either:" -Level Warning
+            Write-LogMessage "    1. Migrate the vault to RBAC: Update-AzKeyVault -EnableRbacAuthorization \$true" -Level Warning
+            Write-LogMessage "    2. Add an access policy manually granting Get/Set on secrets to your account" -Level Warning
+        }
+    }
+
+    # Resolve current principal
+    $principal = Get-CurrentPrincipalObjectId
+    Write-LogMessage "  Current principal: $($principal.DisplayName) [$($principal.PrincipalType)] oid=$($principal.ObjectId)" -Level Info
+
+    # Test if we already have write access using a real-write probe
+    $access = Test-KeyVaultSecretAccess -VaultName $VaultName
+    if ($access.Granted) {
+        Write-LogMessage "  Already have data-plane access to vault." -Level Success
+        return $kv
+    }
+
+    # Track which object IDs we've granted access to, to avoid duplicate work
+    $grantedOids = New-Object System.Collections.Generic.HashSet[string]
+
+    # First grant attempt: use the object ID resolved from the active context
+    Grant-KeyVaultSecretsOfficer -VaultResourceId $kv.ResourceId `
+        -PrincipalObjectId $principal.ObjectId `
+        -PrincipalType $principal.PrincipalType | Out-Null
+    [void]$grantedOids.Add($principal.ObjectId)
+
+    # Poll for RBAC propagation
+    Write-LogMessage "  Waiting for RBAC propagation (can take 30-90 seconds)..." -Level Info
+    $deadline = (Get-Date).AddSeconds($PropagationTimeoutSeconds)
+    $attempt  = 0
+    $additionalGrantsAttempted = 0
+    $maxAdditionalGrants = 2
+
+    while ((Get-Date) -lt $deadline) {
+        $attempt++
+        Start-Sleep -Seconds 10
+
+        $access = Test-KeyVaultSecretAccess -VaultName $VaultName
+        if ($access.Granted) {
+            Write-LogMessage "  Access confirmed after $($attempt * 10)s." -Level Success
+            return $kv
+        }
+
+        # Self-healing: if the 403 reveals a different OID is making the call than
+        # the one we granted, this is the token-mismatch case (stale token cache,
+        # multi-account session). Grant to that OID too.
+        if ($access.ObjectId -and -not $grantedOids.Contains($access.ObjectId) -and $additionalGrantsAttempted -lt $maxAdditionalGrants) {
+            Write-LogMessage "  Detected different principal in 403: oid=$($access.ObjectId)" -Level Warning
+            Write-LogMessage "  This usually means the Az session has a stale or alternate token." -Level Warning
+            Write-LogMessage "  Granting access to the OID actually making the call..." -Level Info
+            try {
+                Grant-KeyVaultSecretsOfficer -VaultResourceId $kv.ResourceId `
+                    -PrincipalObjectId $access.ObjectId `
+                    -PrincipalType 'User' | Out-Null
+                [void]$grantedOids.Add($access.ObjectId)
+                $additionalGrantsAttempted++
+            }
+            catch {
+                Write-LogMessage "  Could not grant role to additional OID: $($_.Exception.Message)" -Level Warning
+            }
+        }
+
+        Write-LogMessage "    Attempt $attempt - still propagating..." -Level Debug
+    }
+
+    # All retries exhausted - give the user actionable next steps
+    $oidHint = if ($access.ObjectId) { "Last 403 was authenticated as: $($access.ObjectId)" } else { "" }
+    $msg = @"
+Key Vault role assignment did not propagate within ${PropagationTimeoutSeconds}s.
+This is most often caused by a stale Az token cache when the session has had
+multiple Connect-AzAccount runs. Granted to: $($grantedOids -join ', ').
+$oidHint
+
+To resolve, run these in order, then re-run the script:
+
+  Disconnect-AzAccount
+  Clear-AzContext -Force
+  Connect-AzAccount
+  Set-AzContext -SubscriptionId <your-subscription-id>
+
+Then re-run the deployment.
+"@
+    throw $msg
+}
+
 function Set-VMKeyVaultSecret {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [string]$VaultName,
         [Parameter(Mandatory)] [string]$SecretName,
         [Parameter(Mandatory)] [string]$SecretValue,
-        [Parameter()]          [string]$ContentType = 'text/plain'
+        [Parameter()]          [string]$ContentType = 'text/plain',
+        [Parameter()]          [int]$MaxRetries = 6
     )
 
     $secure = ConvertTo-SecureString -String $SecretValue -AsPlainText -Force
-    $result = Set-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName `
-        -SecretValue $secure -ContentType $ContentType -ErrorAction Stop
-    Write-LogMessage "  Stored secret: $SecretName -> $($result.Id)" -Level Debug
-    return $result.Id
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            $result = Set-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName `
+                -SecretValue $secure -ContentType $ContentType -ErrorAction Stop
+            Write-LogMessage "  Stored secret: $SecretName -> $($result.Id)" -Level Debug
+            return $result.Id
+        }
+        catch {
+            $msg = $_.Exception.Message
+            # Retry on RBAC-propagation 403s for a short window even though
+            # Initialize-KeyVaultAccess already verified access. Edge cases happen.
+            if ($attempt -lt $MaxRetries -and $msg -match 'Forbidden|AuthorizationFailed|does not have secrets set permission') {
+                $backoff = [int][Math]::Pow(2, $attempt) * 1000
+                Write-LogMessage "  Set-Secret attempt $attempt got 403, retrying in ${backoff}ms..." -Level Debug
+                Start-Sleep -Milliseconds $backoff
+                continue
+            }
+            throw
+        }
+    }
 }
 
 function Invoke-VMInstallation {
@@ -492,7 +1012,28 @@ $rgCreated = $false
 try {
     # ---- Pre-flight ----
     Write-LogMessage "Running pre-flight checks..." -Level Info
-    if (-not (Test-AzureConnection)) { exit 1 }
+
+    $context = Select-AzureContext -TenantId $TenantId -SubscriptionId $SubscriptionId -Interactive:$SelectContext
+    if (-not $context) { exit 1 }
+
+    # Multi-tenant safety: if more than one subscription is accessible and the
+    # caller didn't explicitly pin one, require -ConfirmContext to proceed.
+    # This prevents accidentally deploying into the wrong client's tenant.
+    if (-not $SubscriptionId -and -not $SelectContext) {
+        # WarningAction SilentlyContinue: Get-AzSubscription emits warnings when it
+        # encounters tenants requiring fresh MFA. Those warnings are not failures
+        # and they pollute the output. Subscriptions we CAN see still come back.
+        $accessibleSubs = @(Get-AzSubscription -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
+                            Where-Object { $_.State -eq 'Enabled' })
+        if ($accessibleSubs.Count -gt 1 -and -not $ConfirmContext) {
+            Write-LogMessage "Account has access to $($accessibleSubs.Count) subscriptions but none was pinned." -Level Error
+            Write-LogMessage "Multi-tenant safety: pass one of the following to proceed:" -Level Error
+            Write-LogMessage "  -SubscriptionId <id>     (explicit target)" -Level Error
+            Write-LogMessage "  -SelectContext           (interactive picker)" -Level Error
+            Write-LogMessage "  -ConfirmContext          (accept current context)" -Level Error
+            exit 1
+        }
+    }
 
     foreach ($p in @('Microsoft.Compute', 'Microsoft.Network', 'Microsoft.Storage')) {
         if (-not (Test-AzureProvider -ProviderNamespace $p)) {
@@ -502,10 +1043,28 @@ try {
 
     # Validate region supports requested VM size
     Write-LogMessage "Verifying VM size $VMSize is available in $Location..." -Level Info
-    $sizeAvailable = Get-AzVMSize -Location $Location -ErrorAction Stop |
-                     Where-Object { $_.Name -eq $VMSize }
-    if (-not $sizeAvailable) {
-        throw "VM size $VMSize is not available in region $Location."
+    try {
+        $sizeAvailable = Get-AzComputeResourceSku -Location $Location -ErrorAction Stop |
+                         Where-Object { $_.ResourceType -eq 'virtualMachines' -and $_.Name -eq $VMSize } |
+                         Select-Object -First 1
+
+        if (-not $sizeAvailable) {
+            throw "VM size $VMSize is not available in region $Location."
+        }
+
+        # Check if size has any restrictions in this region (e.g., quota, zone restrictions)
+        if ($sizeAvailable.Restrictions -and $sizeAvailable.Restrictions.Count -gt 0) {
+            $restrictionReasons = $sizeAvailable.Restrictions | ForEach-Object {
+                "$($_.Type): $($_.ReasonCode)"
+            }
+            Write-LogMessage "VM size $VMSize has restrictions in $Location : $($restrictionReasons -join '; ')" -Level Warning
+            Write-LogMessage "Provisioning may fail. Common fix: request quota increase in this region." -Level Warning
+        }
+    }
+    catch {
+        # If the SKU query itself fails (network, permissions), fall back to a more
+        # permissive approach: don't block deployment on this check.
+        Write-LogMessage "Could not verify VM size availability ($($_.Exception.Message)). Proceeding optimistically." -Level Warning
     }
 
     # ---- Resource Group ----
@@ -540,15 +1099,11 @@ try {
 
     if ($UseKeyVault) {
         Write-LogMessage "Configuring Key Vault: $KeyVaultName" -Level Info
-        $kv = Get-AzKeyVault -VaultName $KeyVaultName -ErrorAction SilentlyContinue
-        if (-not $kv) {
-            $kv = New-AzKeyVault -Name $KeyVaultName -ResourceGroupName $ResourceGroupName `
-                -Location $Location -EnableRbacAuthorization
-            Write-LogMessage "  Vault created. RBAC role assignment may be required." -Level Warning
-            Start-Sleep -Seconds 15
-        }
+        $kv = Initialize-KeyVaultAccess -VaultName $KeyVaultName `
+            -ResourceGroup $ResourceGroupName `
+            -Location $Location
 
-        $secretReferences['vm-admin-password']    = Set-VMKeyVaultSecret -VaultName $KeyVaultName -SecretName "$VMName-vm-admin-password"    -SecretValue $vmPassword
+        $secretReferences['vm-admin-password']     = Set-VMKeyVaultSecret -VaultName $KeyVaultName -SecretName "$VMName-vm-admin-password"     -SecretValue $vmPassword
         $secretReferences['mariadb-root-password'] = Set-VMKeyVaultSecret -VaultName $KeyVaultName -SecretName "$VMName-mariadb-root-password" -SecretValue $mariadbPassword
         $secretReferences['erpnext-admin-password']= Set-VMKeyVaultSecret -VaultName $KeyVaultName -SecretName "$VMName-erpnext-admin-password" -SecretValue $erpAdminPassword
     }

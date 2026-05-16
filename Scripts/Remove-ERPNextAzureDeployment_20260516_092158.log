@@ -1,0 +1,11 @@
+[2026-05-16 09:21:58] [Success] Resolved context: JONeillSr@awesomewildstuff.com / Azure subscription 1
+[2026-05-16 09:21:59] [Debug] No resource locks found on JTC-prod-erpnext-eastus-rg.
+[2026-05-16 09:22:00] [Info] Pre-deleting Key Vault for purge handling...
+[2026-05-16 09:22:00] [Debug]   Key Vault: JTC-prod-eastus-kv (not found in RG, checking soft-deleted)
+[2026-05-16 09:22:06] [Debug]   No soft-deleted vault named 'JTC-prod-eastus-kv' to purge.
+[2026-05-16 09:22:06] [Info] Deleting Resource Group 'JTC-prod-erpnext-eastus-rg' (this may take several minutes)...
+[2026-05-16 09:22:06] [Success] Resource Group 'JTC-prod-erpnext-eastus-rg' deleted.
+[2026-05-16 09:22:06] [Info] Cleaning up local artifacts...
+[2026-05-16 09:22:06] [Debug]   No local files match 'erpnext-connection-info.json'
+[2026-05-16 09:22:06] [Debug]   No local files match 'install-erpnext.sh'
+[2026-05-16 09:22:06] [Success]   Deleted local file: Deploy-ERPNextToAzure_20260516_092108.log
