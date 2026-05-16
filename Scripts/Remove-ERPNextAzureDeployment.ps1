@@ -152,7 +152,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      05/15/2026
-    Version:          1.2.0
+    Version:          1.2.2
     GitHub:           https://github.com/JONeillSr/
 
     PREREQUISITES:
@@ -173,6 +173,29 @@
         https://learn.microsoft.com/azure/key-vault/general/soft-delete-overview
 
 .CHANGELOG
+    1.2.2 - 05/16/2026 - Warn about orphaned soft-deleted Key Vaults
+        - After deleting a Resource Group, the script now scans for Key
+          Vaults from that RG that are now in the soft-deleted state. If
+          any are found AND the user didn't pass -PurgeKeyVault, a clearly
+          formatted yellow warning block is shown in the summary explaining:
+            * The vault names are reserved for 90 days
+            * Re-deploying with the same name will fail until purged
+            * The exact command to purge them
+            * The Azure portal alternative
+        - This prevents the surprising "why does my next deploy fail with
+          vault-name-already-exists?" question.
+
+    1.2.1 - 05/16/2026 - Critical: RG deletion polling fix
+        - The poll loop checked "while $rgJob.State -eq 'Running'" but the
+          job starts in 'NotStarted' state. The loop exited immediately
+          without waiting, the script reported success in zero seconds, and
+          the Resource Group remained intact. This wasted no resources but
+          was deeply misleading.
+        - Now waits while state is in any non-terminal state (anything
+          other than Completed/Failed/Stopped), explicitly handles Failed
+          state by surfacing job errors, and verifies the RG is actually
+          gone via Get-AzResourceGroup before reporting success.
+
     1.2.0 - 05/16/2026 - Multi-tenant safety, robust Key Vault purge
 
         Consolidated changes from 1.1.1-1.1.4. Major capability areas:
@@ -277,7 +300,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ScriptVersion = "1.2.0"
+$ScriptVersion = "1.2.2"
 $LogFile = Join-Path $PSScriptRoot "Remove-ERPNextAzureDeployment_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 Write-Host "===============================================================" -ForegroundColor Yellow
@@ -738,6 +761,7 @@ function Remove-LocalArtifacts {
 #region Main
 
 $allResults = @()
+$script:softDeletedFromThisRun = @()
 
 # When the user invokes with -Force, suppress ALL downstream confirmation
 # prompts (including those from Az cmdlets like Remove-AzResourceGroup which
@@ -873,21 +897,65 @@ try {
                 $rgJob = Remove-AzResourceGroup -Name $ResourceGroupName -Force -Confirm:$false -AsJob
                 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 
-                while ($rgJob.State -eq 'Running') {
+                # Wait while the job is in any non-terminal state. The job starts in
+                # 'NotStarted' and transitions through 'Running' to a terminal state
+                # ('Completed', 'Failed', 'Stopped'). Previously we only looped while
+                # State -eq 'Running' which exited immediately if the job was still
+                # 'NotStarted', causing the script to silently skip the actual deletion.
+                $terminalStates = @('Completed', 'Failed', 'Stopped')
+                while ($rgJob.State -notin $terminalStates) {
                     if ((Get-Date) -gt $deadline) {
                         Write-LogMessage "RG deletion exceeded $TimeoutMinutes minute timeout." -Level Error
                         Stop-Job $rgJob
                         throw "Timeout deleting Resource Group."
                     }
-                    Write-LogMessage "  RG deletion in progress... ($([int]((Get-Date) - $rgJob.PSBeginTime).TotalMinutes) min)" -Level Debug
+                    Write-LogMessage "  RG deletion in progress... ($([int]((Get-Date) - $rgJob.PSBeginTime).TotalMinutes) min, state: $($rgJob.State))" -Level Debug
                     Start-Sleep -Seconds 30
+                }
+
+                if ($rgJob.State -eq 'Failed') {
+                    $jobErrors = Receive-Job $rgJob -ErrorAction Continue 2>&1
+                    Remove-Job $rgJob -Force
+                    Write-LogMessage "Resource Group deletion failed:" -Level Error
+                    foreach ($e in $jobErrors) {
+                        Write-LogMessage "  $e" -Level Error
+                    }
+                    throw "Resource Group deletion failed. Check Azure activity log."
                 }
 
                 Receive-Job $rgJob | Out-Null
                 Remove-Job $rgJob -Force
 
+                # Verify the RG is actually gone before reporting success.
+                # Belt-and-suspenders against any future cmdlet quirks where the job
+                # reports Completed without having actually deleted anything.
+                $stillThere = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue
+                if ($stillThere) {
+                    Write-LogMessage "Job reported Completed but Resource Group still exists." -Level Error
+                    throw "Resource Group deletion did not actually delete the resource group."
+                }
+
                 Write-LogMessage "Resource Group '$ResourceGroupName' deleted." -Level Success
                 $allResults += @{ Status = 'Deleted'; Type = 'Resource Group'; Name = $ResourceGroupName }
+
+                # If a Key Vault was in the deleted RG, it's now soft-deleted and the name
+                # is reserved. Detect this so we can warn the user at summary time if they
+                # didn't ask for a purge - prevents the surprising "why does my next deploy
+                # fail with vault-name-already-exists?" question.
+                if (-not $PurgeKeyVault) {
+                    try {
+                        $newlySoftDeleted = @(Get-AzKeyVault -InRemovedState -ErrorAction SilentlyContinue |
+                            Where-Object {
+                                $_.ResourceId -like "*/resourceGroups/$ResourceGroupName/*" -and
+                                $_.DeletionDate -gt (Get-Date).AddMinutes(-30)
+                            })
+                        foreach ($v in $newlySoftDeleted) {
+                            $script:softDeletedFromThisRun += $v.VaultName
+                        }
+                    } catch {
+                        Write-LogMessage "  (Could not scan for soft-deleted vaults: $($_.Exception.Message))" -Level Debug
+                    }
+                }
             }
         }
 
@@ -959,6 +1027,30 @@ try {
 
     Write-Host "Log: $LogFile" -ForegroundColor DarkGray
     Write-Host ""
+
+    # Warn about soft-deleted Key Vaults that were in the deleted RG.
+    # Without an explicit -PurgeKeyVault flag, the vault names are reserved
+    # for 90 days and re-deploying with the same name will fail.
+    if ($script:softDeletedFromThisRun.Count -gt 0) {
+        Write-Host "---------------------------------------------------------------" -ForegroundColor Yellow
+        Write-Host "NOTE: Soft-deleted Key Vault(s) remain" -ForegroundColor Yellow
+        Write-Host "---------------------------------------------------------------" -ForegroundColor Yellow
+        foreach ($vname in $script:softDeletedFromThisRun) {
+            Write-Host "  $vname" -ForegroundColor Yellow
+        }
+        Write-Host ""
+        Write-Host "  These vault names are reserved for 90 days by Azure's soft-delete." -ForegroundColor Yellow
+        Write-Host "  Re-deploying with the same name will fail until they are purged." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  To purge, re-run this script with:" -ForegroundColor Yellow
+        $firstVault = $script:softDeletedFromThisRun[0]
+        Write-Host "    .\Remove-ERPNextAzureDeployment.ps1 -Force ``" -ForegroundColor White
+        Write-Host "        -KeyVaultName '$firstVault' -PurgeKeyVault" -ForegroundColor White
+        Write-Host ""
+        Write-Host "  Or via Azure portal: Key Vault service > Manage deleted vaults" -ForegroundColor Yellow
+        Write-Host "---------------------------------------------------------------" -ForegroundColor Yellow
+        Write-Host ""
+    }
 
     return [PSCustomObject]@{
         ResourceGroup = $ResourceGroupName

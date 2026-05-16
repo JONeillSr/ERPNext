@@ -165,7 +165,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      02/17/2026
-    Version:          1.5.2
+    Version:          1.5.6
     Last Modified:    05/15/2026
     GitHub:           https://github.com/JONeillSr/
 
@@ -355,7 +355,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # Script configuration
-$ScriptVersion = "1.5.2"
+$ScriptVersion = "1.5.6"
 $CompanyName = "JT Custom Trailers"
 $LogFile = Join-Path $PSScriptRoot "Deploy-ERPNextToAzure_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
@@ -1466,9 +1466,48 @@ NEWSITE_EOF
         'echo "  Pre-installing Ansible via apt (Ubuntu 24.04 PEP 668 workaround)..."',
         'sudo -E apt-get install -y ansible',
         '',
+        '# bench setup production has to run TWICE on Ubuntu 24.04. The first',
+        '# invocation generates the supervisor and nginx config files in the bench',
+        '# config/ directory but returns exit 0 before actually creating the',
+        '# /etc/supervisor/conf.d symlink and reloading supervisor. The second',
+        '# invocation picks up where the first left off and completes the symlink,',
+        '# supervisor reread/update, and nginx reload. Without the second run,',
+        '# supervisor has no idea the frappe-bench groups exist and nginx serves',
+        '# a 502 indefinitely. Both runs return exit 0 so set -e cannot catch this.',
+        'echo "  Running bench setup production (first pass: generates configs)..."',
         "sudo bash -c `"cd /home/${AdminUsername}/frappe-bench && bench setup production ${AdminUsername} --yes`"",
-        "sudo bash -c `"cd /home/${AdminUsername}/frappe-bench && bench setup nginx --yes`"",
-        'sudo supervisorctl reload',
+        '',
+        '# Ubuntu 24.04 ships home directories with mode 750 by default (Canonical',
+        '# tightened this in noble vs jammy). Nginx runs as www-data and cannot',
+        '# traverse a 750 directory owned by another user. Apply 755 here before',
+        '# the second bench setup so nginx-related reloads work first try.',
+        'echo "  Adjusting home directory permissions for nginx access..."',
+        'sudo chmod 755 /home/${ADMIN_USER}',
+        '',
+        'echo "  Running bench setup production (second pass: activates configs)..."',
+        "sudo bash -c `"cd /home/${AdminUsername}/frappe-bench && bench setup production ${AdminUsername} --yes`"",
+        '',
+        '# Verify gunicorn is listening on port 8000 before declaring success.',
+        '# Without this we can emit the success sentinel while nginx 502s in production.',
+        'echo "  Verifying Frappe web worker is listening on port 8000..."',
+        'for i in $(seq 1 30); do',
+        '    if sudo ss -tlnp | grep -q ":8000"; then',
+        '        echo "    Port 8000 is up."',
+        '        break',
+        '    fi',
+        '    sleep 2',
+        '    if [ $i -eq 30 ]; then',
+        '        echo "    ERROR: Frappe web worker did not start within 60s." >&2',
+        '        echo "    Supervisor status:" >&2',
+        '        sudo supervisorctl status >&2 || true',
+        '        echo "    Nginx config test:" >&2',
+        '        sudo nginx -t 2>&1 >&2 || true',
+        '        exit 1',
+        '    fi',
+        'done',
+        '',
+        '# Final nginx reload to ensure the new config (generated in pass 2) is live.',
+        'sudo systemctl reload nginx',
         '',
         '# Sentinel: this exact line is parsed by the deploy script to confirm real success.',
         '# If the install bombed earlier, set -euo pipefail will have exited before reaching here.',
