@@ -165,7 +165,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      02/17/2026
-    Version:          1.5.0
+    Version:          1.5.2
     Last Modified:    05/15/2026
     GitHub:           https://github.com/JONeillSr/
 
@@ -355,7 +355,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # Script configuration
-$ScriptVersion = "1.5.0"
+$ScriptVersion = "1.5.2"
 $CompanyName = "JT Custom Trailers"
 $LogFile = Join-Path $PSScriptRoot "Deploy-ERPNextToAzure_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
@@ -982,12 +982,36 @@ function Invoke-VMInstallation {
     }
 
     # Concatenate all output channels for sentinel scan and diagnostic dumping.
+    # Run Command returns output structured as: a single Value entry with
+    # Code='ProvisioningState/succeeded' and Message containing the entire
+    # script output, with literal "[stdout]" and "[stderr]" markers separating
+    # the two streams inside the Message. We must parse this format, not
+    # filter Value entries by Code.
+    $fullOutput = ""
     $stdoutText = ""
     $stderrText = ""
     if ($result.Value) {
         foreach ($v in $result.Value) {
-            if ($v.Code -like '*StdOut*') { $stdoutText += $v.Message }
-            elseif ($v.Code -like '*StdErr*') { $stderrText += $v.Message }
+            if ($v.Message) {
+                $fullOutput += $v.Message + "`n"
+            }
+        }
+    }
+
+    # Split out stdout / stderr sections from the combined output.
+    # Pattern: "[stdout]\n<stdout content>\n[stderr]\n<stderr content>"
+    if ($fullOutput) {
+        $stdoutMatch = [regex]::Match($fullOutput, '(?s)\[stdout\](.*?)(?:\[stderr\]|\z)')
+        if ($stdoutMatch.Success) {
+            $stdoutText = $stdoutMatch.Groups[1].Value.Trim()
+        }
+        $stderrMatch = [regex]::Match($fullOutput, '(?s)\[stderr\](.*?)\z')
+        if ($stderrMatch.Success) {
+            $stderrText = $stderrMatch.Groups[1].Value.Trim()
+        }
+        # If neither marker was found, treat the whole thing as stdout
+        if (-not $stdoutText -and -not $stderrText) {
+            $stdoutText = $fullOutput.Trim()
         }
     }
 
@@ -997,8 +1021,8 @@ function Invoke-VMInstallation {
 
         # Dump tail of stdout (guard against empty output)
         if ($stdoutText.Trim()) {
-            Write-LogMessage "=== Last 50 lines of stdout from the VM: ===" -Level Error
-            $tailLines = $stdoutText -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 50
+            Write-LogMessage "=== Last 80 lines of stdout from the VM: ===" -Level Error
+            $tailLines = $stdoutText -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 80
             foreach ($line in $tailLines) {
                 Write-LogMessage $line -Level Error
             }
@@ -1433,6 +1457,15 @@ NEWSITE_EOF
         'done',
         '',
         'echo "[10/10] Configuring production (Nginx + Supervisor)..."',
+        '',
+        '# Pre-install Ansible via apt to bypass Ubuntu 24.04 PEP 668 enforcement.',
+        '# Frappe Bench v15+ calls "sudo pip install ansible" during setup production',
+        '# without --break-system-packages, which fails on Ubuntu 24.04 with the',
+        '# "externally-managed-environment" error. Installing via apt first means',
+        '# bench will then find it already present and skip its broken pip-install.',
+        'echo "  Pre-installing Ansible via apt (Ubuntu 24.04 PEP 668 workaround)..."',
+        'sudo -E apt-get install -y ansible',
+        '',
         "sudo bash -c `"cd /home/${AdminUsername}/frappe-bench && bench setup production ${AdminUsername} --yes`"",
         "sudo bash -c `"cd /home/${AdminUsername}/frappe-bench && bench setup nginx --yes`"",
         'sudo supervisorctl reload',

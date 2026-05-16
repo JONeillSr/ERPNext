@@ -1,0 +1,8 @@
+[2026-05-16 12:36:32] [Success] Resolved context: JONeillSr@awesomewildstuff.com / Azure subscription 1
+[2026-05-16 12:36:34] [Debug] No resource locks found on JTC-prod-erpnext-eastus-rg.
+[2026-05-16 12:36:34] [Info] Pre-deleting Key Vault for purge handling...
+[2026-05-16 12:36:37] [Success]   Deleted Key Vault: JTC-prod-eastus-kv (was in eastus)
+[2026-05-16 12:36:37] [Warning]   Found soft-deleted Key Vault 'JTC-prod-eastus-kv' in eastus.
+[2026-05-16 12:36:37] [Info]   Initiating purge (timeout: 20 min, polling every 30s)...
+[2026-05-16 12:36:37] [Info]   Note: Key Vault purge typically takes 1-15 minutes depending on region load.
+[2026-05-16 12:37:09] [Success]   Purge confirmed after 0m 30s (vault no longer in soft-deleted list).

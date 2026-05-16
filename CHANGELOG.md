@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.5.2] - 2026-05-16
+
+### Fixed
+
+- **`bench setup production` failed on Ubuntu 24.04 with PEP 668 enforcement.** Frappe Bench v15's `setup_production` step runs `sudo /usr/bin/python3 -m pip install ansible` without the `--break-system-packages` flag. On Ubuntu 24.04 (which ships Python 3.12 with PEP 668 enforcement), this fails with `error: externally-managed-environment`. The install made it through 9 of 10 steps — VM provisioning, MariaDB, Node.js, wkhtmltopdf, bench init, Frappe + ERPNext + HRMS install, Redis discovery — then bombed on the final supervisor/nginx setup.
+
+- **Fix:** The install script now pre-installs `ansible` via `apt-get install -y ansible` before invoking `bench setup production`. When bench then tries to pip-install Ansible, the package is already present and bench proceeds without invoking the broken pip command. Apt-managed Ansible doesn't trigger PEP 668 because it's not a pip install.
+
+### Why bench has this bug
+
+Bench was written before Ubuntu 24.04 / PEP 668. On Ubuntu 22.04 and earlier, `sudo pip install` worked silently and installed packages system-wide. PEP 668 (April 2023) added a marker file `/usr/lib/python3.12/EXTERNALLY-MANAGED` that signals "don't install pip packages system-wide unless you really mean it." Bench hasn't been updated to handle this, so on 24.04 you have to either skip-or-pre-install the problematic packages, or pass `--break-system-packages` everywhere. Pre-installing via apt is the cleaner option.
+
+This same issue affects any Frappe Bench install on Ubuntu 24.04, Debian 12, and other distros that ship PEP 668 enforcement. A workaround in the Frappe community is to remove the EXTERNALLY-MANAGED marker file, but that's globally permissive and not recommended. Pre-installing the specific packages bench needs is targeted.
+
+---
+
+## [1.5.1] - 2026-05-16
+
+### Fixed
+
+- **Diagnostic dump on install failure was always empty.** The deploy script's output-extraction logic filtered `$result.Value` entries by `$v.Code -like '*StdOut*'`, expecting Run Command to return separate stdout and stderr entries. But Run Command actually returns a single Value entry where `Code='ProvisioningState/succeeded'` and the *entire script output* — both stdout and stderr — lives in the `Message` field, separated by inline `[stdout]` and `[stderr]` markers. The filter matched nothing, so the diagnostic always reported "stdout was empty / stderr was empty" even when the script had produced hundreds of lines of output.
+- **The fix parses the Run Command output format correctly:** concatenates all `Value[*].Message` strings, then uses regex to extract the content between the `[stdout]` and `[stderr]` markers. Falls back to treating the whole message as stdout if the markers aren't present.
+- Increased the failure-output tail from 50 to 80 lines since most install failures happen during a multi-line operation (apt, pip, bench init) where context matters.
+
+### Why this matters
+
+Without this fix, every install failure surfaced as "the install didn't reach the sentinel — and by the way I have no idea why." The actual error was always sitting in the Run Command response; we just weren't extracting it. With the fix, the deploy script's output will show the actual bash error inline, so you don't need to make a follow-up `Invoke-AzVMRunCommand` call to retrieve `/var/log/erpnext-install.log` in 95% of cases.
+
+---
+
 ## [1.5.0] - 2026-05-16
 
 **First production-ready release.** This is the consolidation point after a long debugging session that took the toolkit from "deploys infrastructure" to "deploys infrastructure and reliably installs ERPNext end-to-end." See the per-component summaries below; the bug-hunt history that produced these capabilities is preserved in the patch-version entries that follow (1.1.0 through 1.4.7).
@@ -396,6 +426,8 @@ The 1.4.0 script started Redis on 11000 (succeeded), 13000 (succeeded via the "c
 
 ---
 
+[1.5.2]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.1...v1.5.2
+[1.5.1]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.7...v1.5.0
 [1.4.7]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.6...v1.4.7
 [1.4.6]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.5...v1.4.6
