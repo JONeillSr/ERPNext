@@ -76,13 +76,30 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      05/15/2026
-    Version:          1.0.1
+    Version:          1.1.0
     GitHub:           https://github.com/JONeillSr/
 
     PREREQUISITES:
         - PowerShell 7.2 or later
         - Az.Accounts module
         - At least one authenticated Az context (Connect-AzAccount)
+
+.CHANGELOG
+    1.1.0 - 05/16/2026 - Multi-tenant search, location-aware messages
+        - Searches all accessible tenants/subscriptions when given a name
+          pattern with -SearchName, not just the active subscription
+        - Actionable error output when a subscription isn't found:
+          shows currently accessible tenants and suggests next steps
+          (Connect-AzAccount for additional tenant, -Refresh switch, etc.)
+        - Placeholder syntax in error examples uses [name] instead of
+          <name> (PowerShell parses < as reserved redirection operator
+          inside double-quoted strings)
+        - Returns the resolved context for downstream scripts to consume
+
+    1.0.0 - 05/15/2026 - Initial release
+        - Interactive subscription picker
+        - -ListOnly mode to enumerate without changing context
+        - Tenant and subscription pinning via parameters
 
 .LINK
     https://github.com/JONeillSr/
@@ -212,7 +229,7 @@ try {
             Write-Host "To access other tenants/subscriptions, authenticate with another account:" -ForegroundColor DarkGray
             Write-Host ""
             Write-Host "  Connect-AzAccount                            # add another account" -ForegroundColor White
-            Write-Host "  Connect-AzAccount -TenantId '<tenant-id>'    # sign in to a specific tenant" -ForegroundColor White
+            Write-Host "  Connect-AzAccount -TenantId '[tenant-id]'    # sign in to a specific tenant" -ForegroundColor White
             Write-Host "  .\Select-AzureContext.ps1 -Refresh           # re-authenticate and re-list" -ForegroundColor White
             Write-Host ""
         }
@@ -270,7 +287,7 @@ try {
             Write-Host "  .\Select-AzureContext.ps1 -Refresh" -ForegroundColor White
             Write-Host ""
             Write-Host "  # Or sign in to a specific tenant directly" -ForegroundColor White
-            Write-Host "  Connect-AzAccount -TenantId '<tenant-id-or-domain>'" -ForegroundColor White
+            Write-Host "  Connect-AzAccount -TenantId '[tenant-id-or-domain]'" -ForegroundColor White
             Write-Host ""
             exit 1
         }

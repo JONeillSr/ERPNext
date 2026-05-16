@@ -165,7 +165,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      02/17/2026
-    Version:          1.4.0
+    Version:          1.5.0
     Last Modified:    05/15/2026
     GitHub:           https://github.com/JONeillSr/
 
@@ -188,87 +188,75 @@
         - Total:                 ~$100/month
 
 .CHANGELOG
-    1.4.0 - 05/16/2026 - Fixed install failure + silent-success detection
-        - Fixed Redis connection refused during bench new-site. Frappe needs
-          three private Redis instances (ports 11000/12000/13000 for queue,
-          cache, and socketio) running before new-site can succeed. These
-          are NOT the system-level redis-server on 6379. The install script
-          now starts them in the background between bench init and new-site,
-          waits for them to actually accept connections, then hands them
-          off to supervisor management via bench setup production.
-        - Fixed silent install failures being reported as success. Run
-          Command's outer Status only reports whether the bash script was
-          delivered and executed, not its exit code. The install script
-          now emits a sentinel line "ERPNEXT_INSTALL_STATUS=SUCCESS" only
-          if every step completed, and the deploy script scans stdout for
-          that sentinel before reporting success.
-        - On install failure, the deploy now dumps the last 50 lines of
-          stdout plus all stderr, and shows the exact Invoke-AzVMRunCommand
-          to retrieve the full install log from the VM.
+    1.5.0 - 05/16/2026 - Multi-tenant safety, Key Vault hardening, install reliability
 
-    1.3.4 - 05/15/2026 - Probe secret name compliance
-        - Fixed: probe secret name contained underscores, which Key Vault
-          rejects. Secret names must match ^[0-9a-zA-Z-]+$ (alphanumerics
-          and hyphens only). Renamed to 'erpnext-deploy-probe-access'.
+        End-to-end installation is now genuinely reliable. Major capability
+        areas added since 1.1.0:
 
-    1.3.3 - 05/15/2026 - Key Vault token-mismatch self-healing
-        - Probe rewritten to use Set-AzKeyVaultSecret instead of
-          Get-AzKeyVaultSecret. Different Az.KeyVault cmdlets can authenticate
-          as different identities when the token cache has stale entries from
-          prior Connect-AzAccount calls, so testing the actual write operation
-          is the only reliable way to verify access
-        - On RBAC propagation failures, the script now extracts the calling
-          object ID from the 403 error message and grants the role to that
-          OID too (up to 2 additional grants per run)
-        - Detailed remediation guidance when all retries fail - tells the user
-          to Disconnect-AzAccount, Clear-AzContext, and reconnect cleanly
+        Multi-tenant safety (was 1.2.0)
+        - Added -TenantId, -SubscriptionId, -SelectContext, -ConfirmContext
+          parameters for safe operation against multiple Azure AD tenants
+        - Active context is displayed before any destructive operation
+        - When more than one subscription is accessible and none is pinned,
+          the script refuses to proceed without -ConfirmContext
+        - Cross-subscription search on resource-not-found
 
-    1.3.2 - 05/15/2026 - Az.KeyVault 6.x compatibility
-        - New-AzKeyVault parameter for RBAC is now selected at runtime based
-          on the installed module version (Az.KeyVault 6.0 replaced
-          -EnableRbacAuthorization with -DisableRbacAuthorization and made
-          RBAC the default)
-        - Detects existing vaults using legacy access policies and warns
-          that the script's RBAC-based access approach won't work without
-          either migrating the vault or adding an access policy manually
-
-    1.3.1 - 05/15/2026 - Az.Compute 10+ compatibility fixes
-        - Replaced Get-AzVMSize -Location (deprecated in Az.Compute 10.0.1)
-          with Get-AzComputeResourceSku
-        - Added detection of region-specific VM size restrictions
-        - Made size verification non-blocking on lookup errors (proceeds with
-          a warning instead of failing the deployment)
-        - Suppressed cross-tenant token acquisition warnings from
-          Get-AzSubscription when enumerating accessible subscriptions
-
-    1.3.0 - 05/15/2026 - Key Vault RBAC handling
-        - Key Vault now properly grants Key Vault Secrets Officer role to the
-          running identity on creation (previously failed with 403 on first
-          secret write)
-        - Polls for RBAC propagation before attempting secret writes
-        - Detects pre-existing vaults and verifies access rather than blindly
+        Key Vault data-plane reliability (was 1.3.0-1.3.3)
+        - Auto-grants 'Key Vault Secrets Officer' role to the current
+          principal on vault creation when -UseKeyVault is supplied
+        - Polls for RBAC propagation before attempting writes
+        - Detects pre-existing vaults and verifies access rather than
           re-assigning roles
-        - Resolves principal object ID correctly for User, ServicePrincipal,
-          and ManagedService account types
-        - Detects insufficient permissions (Contributor-only) and provides
-          clear remediation guidance
-        - Retry-with-backoff on the actual Set-Secret call as a final
-          safety net for slow RBAC propagation
+        - Self-healing for stale Az token cache: when secret write returns
+          403 with a different principal OID, the script extracts the OID
+          and grants the role to that one as well
+        - Retry-with-backoff on Set-Secret as a final safety net
+        - Probe secret uses naming-compliant pattern (^[0-9a-zA-Z-]+$)
 
-    1.2.0 - 05/15/2026 - Multi-tenant support for consultants
-        - Added -TenantId parameter to target a specific Azure AD tenant
-        - Added -SelectContext for interactive subscription picker
-        - Added -ConfirmContext safety gate when multiple subscriptions are
-          accessible and none is pinned
-        - Active context (account, tenant, subscription) is now displayed
-          prominently before any resource operation
-        - Replaced Test-AzureConnection with richer Select-AzureContext function
+        Install reliability (was 1.4.0, 1.4.2)
+        - Frappe-managed Redis instances (queue, cache, etc.) are now
+          started before 'bench new-site' rather than relying on supervisor
+          which runs later. Without this, new-site fails with connection
+          refused
+        - Redis ports are DISCOVERED from config/redis_*.conf rather than
+          hardcoded - forward-compatible with Frappe version changes
+          (v15 has 2 instances on ports 11000/13000, v14 had 3 instances)
+        - Redis startup logic is delivered as an embedded helper script
+          (/tmp/start-redis-instances.sh) so the complex bash control flow
+          lives in pure bash, not PowerShell strings
 
-    1.1.0 - 05/15/2026 - Major hardening and end-to-end automation
+        Genuine success detection (was 1.4.0, 1.4.1)
+        - Run Command 'Status=Succeeded' only means the bash was delivered
+          and ran. Previously the deploy declared success even when the
+          install bombed mid-run. Now the bash emits a sentinel line
+          'ERPNEXT_INSTALL_STATUS=SUCCESS' only after every step
+          completes, and the deploy script scans stdout for that sentinel
+          before reporting success
+        - On install failure, dumps last 50 lines of stdout, all stderr,
+          and the exact Invoke-AzVMRunCommand to retrieve the full log
+          from /var/log/erpnext-install.log on the VM
+        - Write-LogMessage accepts empty strings via [AllowEmptyString()]
+          to prevent diagnostic dumps from breaking when one channel
+          (typically stderr) is empty
+
+        Parser/quoting hardening (was 1.4.3-1.4.7)
+        - Eliminated PowerShell parser landmines in bash-generation code:
+          * <name> placeholder syntax (< is reserved redirection operator)
+          * Quad-apostrophe ambiguity in single-quoted strings
+          * @' and @" sequences mid-string (here-string opener collision)
+          * Orphan backslash-backtick inside double-quoted strings
+            (escapes the closing quote and creates runaway string)
+        - Complex bash blocks (SQL operations, site creation) now live in
+          PowerShell here-strings (@'...'@) which are fully literal
+
+    1.1.0 - 05/15/2026 - End-to-end automation, Key Vault, SSH key support
+
+        First major release after baseline. Made the script production-grade:
+
         - Added end-to-end installation via Invoke-AzVMRunCommand
         - Added Key Vault integration for secret storage
-        - Added SSH key authentication option
-        - Added source IP restriction for NSG rules
+        - Added SSH key authentication option (-UseSSHKey, -SSHPublicKeyPath)
+        - Added source IP restriction for NSG rules (-AllowedSourceCIDR)
         - Added subscription targeting parameter
         - Added idempotency for all Azure resources
         - Added cleanup-on-failure for partial deployments
@@ -367,7 +355,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # Script configuration
-$ScriptVersion = "1.4.0"
+$ScriptVersion = "1.5.0"
 $CompanyName = "JT Custom Trailers"
 $LogFile = Join-Path $PSScriptRoot "Deploy-ERPNextToAzure_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
@@ -384,6 +372,7 @@ function Write-LogMessage {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string]$Message,
 
         [Parameter()]
@@ -827,7 +816,7 @@ function Initialize-KeyVaultAccess {
         if ($kv.PSObject.Properties.Name -contains 'EnableRbacAuthorization' -and -not $kv.EnableRbacAuthorization) {
             Write-LogMessage "  WARNING: Existing vault uses legacy access policies, not RBAC." -Level Warning
             Write-LogMessage "  This script grants access via RBAC roles. You may need to either:" -Level Warning
-            Write-LogMessage "    1. Migrate the vault to RBAC: Update-AzKeyVault -EnableRbacAuthorization \$true" -Level Warning
+            Write-LogMessage "    1. Migrate the vault to RBAC: Update-AzKeyVault -EnableRbacAuthorization `$true" -Level Warning
             Write-LogMessage "    2. Add an access policy manually granting Get/Set on secrets to your account" -Level Warning
         }
     }
@@ -1005,20 +994,33 @@ function Invoke-VMInstallation {
     if ($stdoutText -notmatch 'ERPNEXT_INSTALL_STATUS=SUCCESS') {
         Write-LogMessage "Installation did NOT reach the success sentinel." -Level Error
         Write-LogMessage "This means the bash script exited before completing all steps." -Level Error
-        Write-LogMessage "" -Level Error
-        Write-LogMessage "=== Last 50 lines of stdout from the VM: ===" -Level Error
-        $tailOut = ($stdoutText -split "`n" | Where-Object { $_ } | Select-Object -Last 50) -join "`n"
-        Write-LogMessage $tailOut -Level Error
-        if ($stderrText.Trim()) {
-            Write-LogMessage "" -Level Error
-            Write-LogMessage "=== Stderr from the VM: ===" -Level Error
-            Write-LogMessage $stderrText -Level Error
+
+        # Dump tail of stdout (guard against empty output)
+        if ($stdoutText.Trim()) {
+            Write-LogMessage "=== Last 50 lines of stdout from the VM: ===" -Level Error
+            $tailLines = $stdoutText -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 50
+            foreach ($line in $tailLines) {
+                Write-LogMessage $line -Level Error
+            }
+        } else {
+            Write-LogMessage "(stdout was empty)" -Level Error
         }
-        Write-LogMessage "" -Level Error
+
+        # Dump stderr (guard against empty)
+        if ($stderrText.Trim()) {
+            Write-LogMessage "=== Stderr from the VM: ===" -Level Error
+            $errLines = $stderrText -split "`n" | Where-Object { $_.Trim() }
+            foreach ($line in $errLines) {
+                Write-LogMessage $line -Level Error
+            }
+        } else {
+            Write-LogMessage "(stderr was empty)" -Level Error
+        }
+
         Write-LogMessage "Full install log on the VM: /var/log/erpnext-install.log" -Level Error
         Write-LogMessage "Retrieve with:" -Level Error
-        Write-LogMessage "  Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroup -VMName $VMName ``" -Level Error
-        Write-LogMessage "    -CommandId RunShellScript -ScriptString 'tail -200 /var/log/erpnext-install.log'" -Level Error
+        Write-LogMessage "  Invoke-AzVMRunCommand -ResourceGroupName '$ResourceGroup' -VMName '$VMName' \" -Level Error
+        Write-LogMessage "    -CommandId RunShellScript -ScriptString 'tail -300 /var/log/erpnext-install.log'" -Level Error
         throw "ERPNext installation did not complete - sentinel not found in output."
     }
 
@@ -1075,7 +1077,7 @@ try {
         if ($accessibleSubs.Count -gt 1 -and -not $ConfirmContext) {
             Write-LogMessage "Account has access to $($accessibleSubs.Count) subscriptions but none was pinned." -Level Error
             Write-LogMessage "Multi-tenant safety: pass one of the following to proceed:" -Level Error
-            Write-LogMessage "  -SubscriptionId <id>     (explicit target)" -Level Error
+            Write-LogMessage "  -SubscriptionId [id]     (explicit target)" -Level Error
             Write-LogMessage "  -SelectContext           (interactive picker)" -Level Error
             Write-LogMessage "  -ConfirmContext          (accept current context)" -Level Error
             exit 1
@@ -1282,12 +1284,27 @@ try {
         '    nginx supervisor curl wget xvfb libfontconfig xfonts-75dpi xfonts-base \',
         '    software-properties-common build-essential',
         '',
-        'echo "[3/10] Securing MariaDB..."',
-        'sudo mysql -e "ALTER USER ''root''@''localhost'' IDENTIFIED BY ''${MARIADB_ROOT_PW}'';"',
-        'sudo mysql -u root -p"${MARIADB_ROOT_PW}" -e "DELETE FROM mysql.user WHERE User='''';"',
-        'sudo mysql -u root -p"${MARIADB_ROOT_PW}" -e "DELETE FROM mysql.user WHERE User=''root'' AND Host NOT IN (''localhost'',''127.0.0.1'',''::1'');"',
-        'sudo mysql -u root -p"${MARIADB_ROOT_PW}" -e "DROP DATABASE IF EXISTS test;"',
-        'sudo mysql -u root -p"${MARIADB_ROOT_PW}" -e "FLUSH PRIVILEGES;"',
+        'echo "[3/10] Securing MariaDB..."'
+    )
+
+    # Use a PowerShell here-string for the SQL block. Inside @' ... '@,
+    # NOTHING is parsed - no $ expansion, no @' confusion, no quote ambiguity.
+    # We split the install script construction into multiple array pieces to
+    # isolate the SQL block in its own here-string.
+    $sqlBlockLines = (@'
+sudo mysql <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${MARIADB_ROOT_PW}';
+EOF
+sudo mysql -u root -p"${MARIADB_ROOT_PW}" <<EOF
+DELETE FROM mysql.user WHERE User = '';
+DELETE FROM mysql.user WHERE User = 'root' AND Host NOT IN ('localhost','127.0.0.1','::1');
+DROP DATABASE IF EXISTS test;
+FLUSH PRIVILEGES;
+EOF
+'@) -split "`n"
+
+    $installLines += $sqlBlockLines
+    $installLines += @(
         '',
         'echo "[4/10] Tuning MariaDB for ERPNext..."',
         'sudo tee /etc/mysql/mariadb.conf.d/60-erpnext.cnf > /dev/null <<''EOF''',
@@ -1326,42 +1343,92 @@ try {
         'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench get-app erpnext --branch version-15"',
         'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench get-app hrms --branch version-15"',
         '',
-        '# CRITICAL: Frappe needs three Redis instances running on ports 11000, 12000, 13000',
-        '# (queue, cache, socketio) before "bench new-site" can succeed. These are NOT the',
-        '# system-level redis-server on port 6379 - they are bench-managed instances whose',
-        '# configs are generated by "bench init" in config/redis_*.conf.',
-        '# We start them in the background here, run new-site, then they will be migrated',
-        '# to supervisor management by "bench setup production" at the end.',
+        '# CRITICAL: Frappe needs its private Redis instances running before',
+        '# "bench new-site" can succeed. Frappe v15 uses two by default:',
+        '#   redis_queue.conf (default port 11000)',
+        '#   redis_cache.conf (default port 13000)',
+        '# Older versions also had redis_socketio.conf on port 12000, dropped in v15.',
+        '# Port assignments and config files are subject to change between Frappe',
+        '# versions, so we discover them dynamically from the generated configs',
+        '# rather than hardcoding.',
         'echo "[8a/10] Starting Frappe-managed Redis instances..."',
-        'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && nohup redis-server config/redis_queue.conf >/tmp/redis_queue.log 2>&1 &"',
-        'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && nohup redis-server config/redis_cache.conf >/tmp/redis_cache.log 2>&1 &"',
-        'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && nohup redis-server config/redis_socketio.conf >/tmp/redis_socketio.log 2>&1 &"',
         '',
-        '# Wait for the Redis instances to actually accept connections before proceeding.',
-        '# Without this we hit Connection refused errors in bench new-site.',
-        'echo "[8b/10] Waiting for Redis instances to be ready..."',
-        'for port in 11000 12000 13000; do',
+        '# Embedded helper script (avoids PowerShell-to-bash quoting hell for the complex',
+        '# control flow below). Written as a heredoc so PowerShell never tries to parse',
+        '# the bash variables/operators.',
+        'cat > /tmp/start-redis-instances.sh <<''REDIS_HELPER_EOF''',
+        '#!/bin/bash',
+        'set -e',
+        'BENCH_DIR="$1"',
+        'ADMIN_USER="$2"',
+        'OUT_PORTS_FILE="$3"',
+        '',
+        'cd "$BENCH_DIR"',
+        'CONFIGS=$(ls config/redis_*.conf 2>/dev/null)',
+        'if [ -z "$CONFIGS" ]; then',
+        '    echo "  ERROR: No redis_*.conf files found" >&2',
+        '    exit 1',
+        'fi',
+        'echo "  Found Redis configs:"',
+        'echo "$CONFIGS" | sed "s/^/    /"',
+        '',
+        '> "$OUT_PORTS_FILE"',
+        'for conf in $CONFIGS; do',
+        '    conf_basename=$(basename "$conf" .conf)',
+        '    port=$(grep -E "^port " "$conf" | awk "{print \$2}" | head -1)',
+        '    if [ -z "$port" ]; then',
+        '        echo "  WARNING: no port directive in $conf, skipping" >&2',
+        '        continue',
+        '    fi',
+        '    echo "  Starting $conf_basename on port $port..."',
+        '    sudo -u "$ADMIN_USER" bash -c "cd $BENCH_DIR && nohup redis-server $conf >/tmp/$conf_basename.log 2>&1 &"',
+        '    echo "$port" >> "$OUT_PORTS_FILE"',
+        'done',
+        '',
+        'echo "  Waiting for Redis instances to be ready..."',
+        'while read -r port; do',
         '    for i in $(seq 1 30); do',
-        '        if redis-cli -p $port ping 2>/dev/null | grep -q PONG; then',
-        '            echo "  Redis on port $port is up."',
+        '        if redis-cli -p "$port" ping 2>/dev/null | grep -q PONG; then',
+        '            echo "    Redis on port $port is up."',
         '            break',
         '        fi',
         '        sleep 1',
-        '        if [ $i -eq 30 ]; then',
-        '            echo "  ERROR: Redis on port $port did not start within 30s." >&2',
+        '        if [ "$i" -eq 30 ]; then',
+        '            echo "    ERROR: Redis on port $port did not start within 30s." >&2',
+        '            cat /tmp/redis_*.log >&2 2>/dev/null || true',
         '            exit 1',
         '        fi',
         '    done',
-        'done',
+        'done < "$OUT_PORTS_FILE"',
+        'REDIS_HELPER_EOF',
         '',
-        'echo "[9/10] Creating site and installing apps..."',
-        'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench new-site jtcustomtrailers.local --mariadb-root-password ''${MARIADB_ROOT_PW}'' --admin-password ''${ERPNEXT_ADMIN_PW}''"',
-        'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench --site jtcustomtrailers.local install-app erpnext"',
-        'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench --site jtcustomtrailers.local install-app hrms"',
+        'chmod +x /tmp/start-redis-instances.sh',
+        '/tmp/start-redis-instances.sh /home/${ADMIN_USER}/frappe-bench ${ADMIN_USER} /tmp/redis-ports.list',
+        'REDIS_PORTS=$(tr "\n" " " < /tmp/redis-ports.list)',
+        'echo "[8b/10] Redis startup complete. Ports: $REDIS_PORTS"',
         '',
-        '# Stop the standalone Redis instances - they will be replaced by supervisor-managed ones.',
+        'echo "[9/10] Creating site and installing apps..."'
+    )
+
+    # Site creation needs the passwords as bash variables interpolated into
+    # quoted shell arguments. Using a here-string here avoids the PS quad-quote
+    # ambiguity and the @' here-string opener confusion.
+    $siteCreationLines = (@'
+sudo -u "${ADMIN_USER}" bash <<NEWSITE_EOF
+cd /home/${ADMIN_USER}/frappe-bench
+bench new-site jtcustomtrailers.local --mariadb-root-password "${MARIADB_ROOT_PW}" --admin-password "${ERPNEXT_ADMIN_PW}"
+bench --site jtcustomtrailers.local install-app erpnext
+bench --site jtcustomtrailers.local install-app hrms
+NEWSITE_EOF
+'@) -split "`n"
+
+    $installLines += $siteCreationLines
+    $installLines += @(
+        '',
+        '# Stop the standalone Redis instances we started - they will be replaced',
+        '# by supervisor-managed ones in the next step.',
         'echo "[9a/10] Stopping standalone Redis (will be replaced by supervisor)..."',
-        'for port in 11000 12000 13000; do',
+        'for port in $REDIS_PORTS; do',
         '    redis-cli -p $port shutdown nosave 2>/dev/null || true',
         'done',
         '',

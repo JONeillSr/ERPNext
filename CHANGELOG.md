@@ -6,6 +6,163 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.5.0] - 2026-05-16
+
+**First production-ready release.** This is the consolidation point after a long debugging session that took the toolkit from "deploys infrastructure" to "deploys infrastructure and reliably installs ERPNext end-to-end." See the per-component summaries below; the bug-hunt history that produced these capabilities is preserved in the patch-version entries that follow (1.1.0 through 1.4.7).
+
+### Deploy-ERPNextToAzure.ps1 → 1.5.0
+
+**Multi-tenant safety.** `-TenantId`, `-SubscriptionId`, `-SelectContext`, and `-ConfirmContext` parameters for safe operation across multiple Azure AD tenants. The script refuses to proceed when multiple subscriptions are accessible and none is pinned, and displays the active context before any destructive operation.
+
+**Key Vault data-plane reliability.** Auto-grants Key Vault Secrets Officer to the current principal on vault creation. Polls for RBAC propagation. Self-heals when a stale Az token cache causes the secret write to authenticate as a different principal OID. Retry-with-backoff on `Set-AzKeyVaultSecret`. Probe secret name follows Key Vault's `^[0-9a-zA-Z-]+$` rule.
+
+**Install reliability.** Frappe-managed Redis instances are started before `bench new-site`. Redis ports are discovered dynamically from `config/redis_*.conf` rather than hardcoded, making the script forward-compatible across Frappe versions (v15 uses 2 instances, v14 used 3, ports moved). Complex Redis startup runs from an embedded helper script (`/tmp/start-redis-instances.sh`) on the VM.
+
+**Genuine success detection.** The bash install emits a sentinel line `ERPNEXT_INSTALL_STATUS=SUCCESS` only after every step completes; the deploy script scans stdout for that sentinel before reporting success. On failure, dumps last 50 lines of stdout, all stderr, and the exact `Invoke-AzVMRunCommand` to retrieve the full log from `/var/log/erpnext-install.log` on the VM.
+
+**Parser/quoting hardening.** Eliminated PowerShell parser landmines in the bash-generation code (reserved-operator `<`, quad-apostrophe ambiguity, `@'`/`@"` here-string opener collision, orphan backslash-backtick runaway string). Complex bash blocks (SQL operations, site creation) live in PowerShell here-strings `@'...'@` which are fully literal.
+
+### Remove-ERPNextAzureDeployment.ps1 → 1.2.0
+
+Multi-tenant safety parameters at parity with the deploy script. Cross-subscription search when the target resource group isn't in the active subscription. Key Vault purge handles vaults orphaned outside their original resource group, polls every 30 seconds for completion (20-minute timeout), and provides clear remediation steps if it times out. `-Force` now genuinely suppresses all downstream confirmation prompts via `$ConfirmPreference = 'None'`.
+
+### Select-AzureContext.ps1 → 1.1.0
+
+Searches all accessible tenants and subscriptions for a name pattern via `-SearchName`, not just the active subscription. Actionable error output when subscriptions can't be found, including suggestions to authenticate additional tenants. Used by both deploy and teardown scripts for context resolution.
+
+### Import-ERPNextCategories.ps1 → 1.1.0 (unchanged)
+
+No changes in this release. Tracked here for completeness.
+
+---
+
+## [1.4.7] - 2026-05-16
+
+### Fixed
+
+- **The root cause of every parser failure from 1.4.3 onward.** An orphan `` \` `` (backslash-backtick) at the end of a `Write-LogMessage` string in the diagnostic-dump section was eating the closing `"` of that string, turning the line into a runaway double-quoted string that consumed the next ~500 lines of code. PowerShell's parser stayed in double-string state from line 1100 all the way to wherever the next unescaped `"` happened to appear, mis-parsing braces and parens inside what it thought was string content. PSScriptAnalyzer's reported errors at lines 1002, 1057, 1431, 1553, and 1575 were ALL downstream cascades from this single character.
+
+  ```powershell
+  # Wrong (eats closing quote, runs into next ~500 lines):
+  Write-LogMessage "  Invoke-AzVMRunCommand -ResourceGroupName '$ResourceGroup' -VMName '$VMName' \`" -Level Error
+
+  # Right:
+  Write-LogMessage "  Invoke-AzVMRunCommand -ResourceGroupName '$ResourceGroup' -VMName '$VMName' \" -Level Error
+  ```
+
+- The `` \` `` was originally intended to suggest "backslash for line-continuation" to the user reading the error output. But inside a PowerShell double-quoted string, the backtick is the escape character, so `` `" `` is the escape sequence for a literal `"` — which silently ate the string's closing quote.
+
+### How a one-character bug masqueraded as five different problems
+
+Once `"` was escaped at line 1100, PowerShell's tokenizer thought the rest of the file (from line 1100 onward) was string content. Every `{`, `}`, `(`, `)`, `[`, `]`, and `"` that appeared in code from that point on was misinterpreted. The parser only realized something was wrong when it reached the end of the file still expecting a closing `"` — hence "missing terminator" at line 1553. PSScriptAnalyzer's earlier errors (missing brace at 1002, missing brace at 1057, unexpected token at 1431) were all the parser making increasingly wrong guesses about where it was. The real bug was 500 lines upstream from any reported error.
+
+Lessons reinforced:
+
+1. **PSScriptAnalyzer errors often point to symptoms, not causes.** The first reported error is sometimes hundreds of lines after the actual bug. Search backward from the first error for unterminated strings, mismatched braces, and stray escapes.
+2. **`` \` `` (backslash-backtick) is never what you want.** If you need a literal backslash in PowerShell, just type `\`. If you need a literal backtick, escape it with another backtick: `` `` ``.
+3. **Adding entries to the global "dangerous sequences" list:** `` `" `` inside a double-quoted string is the escape for `"`; an orphan one will eat your closing quote and turn the next thousand lines into a string.
+
+---
+
+## [1.4.6] - 2026-05-16
+
+### Fixed
+
+- **Strategic refactor: complex bash blocks now use PowerShell here-strings.** After repeated parser failures in different spots — `<` reserved operator (1.4.3), quad-apostrophe ambiguity (1.4.4), `@'` here-string opener (1.4.5), and now an "unexpected token" in seemingly clean single-quoted strings — it became clear that line-by-line PowerShell string arrays are too fragile for complex bash content. Every new pattern was a new landmine.
+- **The fix:** The SQL block, Redis-startup block, and site-creation block are now constructed via PowerShell here-strings (`@'...'@`) which are fully literal — no tokenization, no operator parsing, no quote ambiguity. Each here-string is split into lines and concatenated to `$installLines`. PowerShell's parser sees the here-string content as opaque text and emits it verbatim into the bash script.
+- **The Redis startup block** went a step further: it's now written to `/tmp/start-redis-instances.sh` on the VM as a separate bash helper script. The complex control flow (config discovery, parallel-ish startup, port wait loops, error reporting) lives entirely in pure bash. The install script just creates the helper and invokes it.
+
+### Architecture notes
+
+The install-script generation now uses three distinct construction methods, chosen for the content:
+
+| Content type | Method | Why |
+|---|---|---|
+| Simple bash lines (echo, apt-get, single sudo) | String array element | Easy to read; works for low-complexity lines |
+| Complex bash with quotes/redirection/special chars | PS here-string `@'...'@`, split into lines | Fully literal; no PS tokenization |
+| Multi-step control flow (loops, conditionals) | Embedded bash helper script | Pure bash; isolated from PS entirely |
+
+This layered approach should be more resilient to future content additions.
+
+---
+
+## [1.4.5] - 2026-05-16
+
+### Fixed
+
+- **`@'` here-string opener collision in SQL syntax.** The 1.4.4 fix used MySQL's standard `'root'@'localhost'` user-host syntax inside a PowerShell double-quoted string. PowerShell saw the `@'` substring and treated it as a here-string header opener (PowerShell here-strings: `@'...'@`) — then complained that characters appeared after the header. This is a PowerShell tokenizer quirk: the `@'` and `@"` sequences are matched even when they appear mid-string.
+- **Switched to MySQL's double-quoted identifier form.** Changed `'root'@'localhost'` to `"root"@"localhost"`. MySQL accepts double-quoted strings as literals by default (without `ANSI_QUOTES` mode), so this is functionally equivalent. The full SQL block is now inside PowerShell single-quoted strings (where nothing is parsed), with no `@'` anywhere in the source — completely safe.
+
+### Lessons learned (running tally)
+
+PowerShell-generated bash scripts can hit parser issues with surprising sequences:
+- `<` inside double-quoted strings → reserved redirection operator (fixed in 1.4.3)
+- `''''` (four apostrophes) inside single-quoted strings → ambiguous (fixed in 1.4.4)
+- `@'` or `@"` anywhere inside strings → here-string opener match (fixed in 1.4.5)
+
+**Defensive rules going forward:**
+1. Prefer single-quoted PowerShell strings for bash lines (no interpolation needed; nothing parsed)
+2. When bash variable interpolation is needed, keep it on its own line and use backtick-escaped `` `${var} `` in double-quoted PS strings
+3. Use bash heredocs to escape PowerShell's parser entirely for complex content
+4. Avoid the literal character sequences `@'`, `@"`, `'@`, `"@`, `''''`, and unescaped `<`/`>` in any string
+
+---
+
+## [1.4.4] - 2026-05-16
+
+### Fixed
+
+- **PowerShell wouldn't parse the script (second case).** The MariaDB secure-installation block had this line:
+  ```
+  'sudo mysql -u root -p"${MARIADB_ROOT_PW}" -e "DELETE FROM mysql.user WHERE User='''';"',
+  ```
+  Four consecutive apostrophes (`''''`) inside a PowerShell single-quoted string. PowerShell's tokenizer treated this ambiguously — `''` is the escape for a literal `'` inside single quotes, but the parser couldn't decide whether `''''` was "two escaped apostrophes" or "close-string then open-string then close-string."
+- **Rewrote the entire MariaDB block as bash heredocs.** Instead of `mysql -e "SQL with nested quotes"`, the new approach uses `mysql <<EOF` and passes SQL via stdin. This eliminates all the PowerShell-to-bash quote-escaping complexity for that block — the SQL inside the heredoc is read literally by mysql, no extra layers of escaping needed. Bonus: the bash is also significantly more readable.
+
+### Notes on PowerShell-generated bash
+
+This kind of bug is the recurring tax of generating bash inside PowerShell strings. As a general rule going forward: any time the bash would need nested SQL/JSON/quoted-string content, prefer heredocs over `-e` or `-c` flags. Heredocs treat their content as raw text, sidestepping both layers of escaping.
+
+---
+
+## [1.4.3] - 2026-05-16
+
+### Fixed
+
+- **Script wouldn't even parse: "The '<' operator is reserved for future use."** PowerShell's parser treats `<` inside double-quoted strings as a reserved redirection operator and refuses to parse the file. The 1.4.0 multi-tenant safety-gate error messages used `"-SubscriptionId <id>"` to show placeholder syntax to users. PowerShell saw the literal `<` and bailed at parse time, before any code could run.
+- Replaced all `<placeholder>` notation with `[placeholder]` in error messages and user-facing help text across `Deploy-ERPNextToAzure.ps1` and `Select-AzureContext.ps1`. Square brackets read naturally as placeholder syntax and have no special meaning in PowerShell strings.
+
+---
+
+## [1.4.2] - 2026-05-16
+
+### Fixed
+
+- **Install hung waiting for a Redis port that doesn't exist in current Frappe.** Frappe v15 consolidated from three Redis instances (queue/cache/socketio on ports 11000/12000/13000) to two (queue and cache only), and moved the cache port from 12000 to 13000. The script hardcoded all three original ports and would wait 30 seconds for port 12000 before bailing — even though `bench init` had successfully created the correct two configs and `redis-server` was running on the correct ports.
+- **Redis config discovery is now dynamic.** The script globs `config/redis_*.conf` after `bench init` to discover which Redis instances `bench` actually wants, then reads each config's `port` directive with grep+awk to determine which port to wait on. This is forward-compatible with whatever future Frappe versions decide to do with Redis topology.
+- **Better failure diagnostics.** If a Redis instance fails to start, the script now dumps the contents of `/tmp/redis_*.log` to stderr so the actual startup error is visible in the deploy output, not buried in a file on the VM.
+
+### Diagnosis notes (for posterity)
+
+The earlier 1.4.0 install logic was based on an outdated assumption about Frappe's Redis topology. Confirming with a fresh `bench init` against version-15 showed:
+- `config/redis_queue.conf` → `port 11000`
+- `config/redis_cache.conf` → `port 13000`
+- `config/redis_socketio.conf` → **does not exist**
+
+The 1.4.0 script started Redis on 11000 (succeeded), 13000 (succeeded via the "cache" command but checking for it as "socketio"), and tried to start something on 12000 with a config file that doesn't exist (silent failure since the start command ran via `nohup ... &`). Then it waited on port 12000 forever.
+
+---
+
+## [1.4.1] - 2026-05-16
+
+### Fixed
+
+- **Diagnostic dump for install failures was broken.** When the deploy script tried to dump stderr/stdout after an install failure, `Write-LogMessage` threw "Cannot bind argument to parameter 'Message' because it is an empty string" — its `Mandatory` `[string]` parameter rejected empty values, even though empty stderr is a perfectly normal case. This swallowed the actual diagnostic output and made it impossible to see why the install failed.
+- Added `[AllowEmptyString()]` attribute to `Write-LogMessage`'s `Message` parameter in both deploy and teardown scripts. This is a class-of-bug fix — any future place that logs potentially-empty content will work correctly.
+- Rewrote the failure-output dump to iterate stdout/stderr line by line, with explicit empty-section markers (`(stdout was empty)` / `(stderr was empty)`) so the operator knows the dump itself succeeded even when one channel had no content.
+
+---
+
 ## [1.4.0] - 2026-05-16
 
 ### Fixed
@@ -239,6 +396,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+[1.5.0]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.7...v1.5.0
+[1.4.7]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.6...v1.4.7
+[1.4.6]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.5...v1.4.6
+[1.4.5]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.4...v1.4.5
+[1.4.4]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.3...v1.4.4
+[1.4.3]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.2...v1.4.3
+[1.4.2]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.1...v1.4.2
+[1.4.1]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.8...v1.4.0
 [1.3.8]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.7...v1.3.8
 [1.3.7]: https://github.com/JONeillSr/erpnext-azure/compare/v1.3.6...v1.3.7

@@ -1,7 +1,0 @@
-[2026-05-15 19:04:22] [Success]   Purged Key Vault: JTC-prod-eastus-kv (name now available for reuse)
-[2026-05-15 19:04:22] [Info] Deleting Resource Group 'JTC-prod-erpnext-eastus-rg' (this may take several minutes)...
-[2026-05-15 19:04:22] [Success] Resource Group 'JTC-prod-erpnext-eastus-rg' deleted.
-[2026-05-15 19:04:22] [Info] Cleaning up local artifacts...
-[2026-05-15 19:04:22] [Debug]   No local files match 'erpnext-connection-info.json'
-[2026-05-15 19:04:22] [Debug]   No local files match 'install-erpnext.sh'
-[2026-05-15 19:04:22] [Debug]   No local files match 'Deploy-ERPNextToAzure_*.log'

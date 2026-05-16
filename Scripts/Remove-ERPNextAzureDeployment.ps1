@@ -152,7 +152,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      05/15/2026
-    Version:          1.1.4
+    Version:          1.2.0
     GitHub:           https://github.com/JONeillSr/
 
     PREREQUISITES:
@@ -173,66 +173,48 @@
         https://learn.microsoft.com/azure/key-vault/general/soft-delete-overview
 
 .CHANGELOG
-    1.1.4 - 05/15/2026 - Force flag now actually suppresses all prompts
-        - Despite -Force being passed to the script, Remove-AzResourceGroup
-          and other Az cmdlets were still showing their own confirmation
-          prompts mid-teardown. When -Force is supplied, the script now sets
-          $ConfirmPreference = 'None' and $PSDefaultParameterValues['*:Confirm']
-          = $false to suppress all downstream prompts globally
+    1.2.0 - 05/16/2026 - Multi-tenant safety, robust Key Vault purge
+
+        Consolidated changes from 1.1.1-1.1.4. Major capability areas:
+
+        Multi-tenant safety (parity with deploy script)
+        - Added -TenantId, -SubscriptionId, -SelectContext, -ConfirmContext
+        - When resource group is not in the active subscription, the script
+          now searches accessible subscriptions and reports where it lives
+          rather than failing with 'not found'
+        - Active context displayed before any destructive operation
+
+        Key Vault purge reliability
+        - The -PurgeKeyVault path handles soft-deleted vaults outside the
+          target RG (the RG is gone but the vault name is reserved)
+        - Active polling: checks soft-deleted vault list every 30 seconds.
+          The vault disappearing from the list confirms purge regardless of
+          whether the cmdlet has returned. 20-minute total timeout
+        - Periodic progress messages so the operator knows the script is
+          alive during the slow Azure backend operation
+        - On purge timeout: clear remediation steps (Az session reset,
+          Azure portal 'Manage deleted vaults' workaround)
+
+        -Force flag now actually suppresses ALL prompts
+        - Previously Remove-AzResourceGroup showed its own confirmation
+          prompt mid-teardown despite -Force. The script now sets
+          $ConfirmPreference = 'None' and
+          $PSDefaultParameterValues['*:Confirm'] = $false when -Force is
+          passed, suppressing all downstream prompts globally
         - Belt-and-suspenders -Confirm:$false on Remove-AzResourceGroup
 
-    1.1.3 - 05/15/2026 - Purge progress polling
-        - The previous 3-minute purge timeout was too aggressive; Key Vault
-          purge legitimately takes 10-15+ minutes in some regions
-        - Replaced blind cmdlet timeout with active polling of the
-          soft-deleted vault list. The vault disappearing from the list is
-          the definitive sign of success, regardless of whether the cmdlet
-          itself has returned yet
-        - Extended timeout to 20 minutes
-        - Periodic progress logs every 30 seconds so the user knows the
-          script is alive
+        Diagnostic improvements
+        - Write-LogMessage accepts empty strings via [AllowEmptyString()]
+          for consistent behavior with the deploy script
 
-    1.1.2 - 05/15/2026 - Key Vault purge timeout protection
-        - Wrapped Remove-AzKeyVault -InRemovedState in a background job with
-          a 3-minute timeout. The cmdlet can hang silently when the Az token
-          cache has stale entries (multi-tenant consultant sessions) or when
-          the calling principal lacks Purge Soft-Deleted Vaults permission
-        - On timeout: surfaces clean remediation steps (Az session reset)
-          plus the Azure portal "Manage deleted vaults" workaround
-
-    1.1.1 - 05/15/2026 - Key Vault purge interactive-prompt fix
-        - Get-AzKeyVault -VaultName -InRemovedState requires -Location as a
-          mandatory parameter. The script previously omitted it, causing
-          PowerShell to interactively prompt the user mid-teardown. Now the
-          location is captured during pre-delete and reused for the
-          soft-deleted lookup. The orphaned-vault path uses the list-all
-          parameter set, which doesn't require Location.
-
-    1.1.0 - 05/15/2026 - Multi-tenant support for consultants
-        - Added -TenantId parameter to target a specific Azure AD tenant
-        - Added -SelectContext for interactive subscription picker
-        - Replaced Test-AzureConnection with richer Select-AzureContext function
-        - Teardown plan now shows tenant ID in addition to account and
-          subscription
-
-    1.0.1 - 05/15/2026 - Diagnostics and WhatIf fixes
-        - Fixed -WhatIf propagating into internal log writes (noisy "Add Content"
-          prompts during dry-run)
-        - When the target Resource Group isn't found in the current
-          subscription, the script now searches all accessible subscriptions
-          and reports where the RG actually lives, with the exact
-          -SubscriptionId command to re-run
-        - Teardown plan now shows the active Azure account and subscription
-          before any action, so wrong-context runs are obvious immediately
-
-    1.0.0 - 05/15/2026 - Initial release
-        - ResourceGroup and Selective teardown modes
-        - Resource lock detection and optional removal
-        - Key Vault soft-delete handling and purge support
-        - Local artifact cleanup
-        - Production subscription safety check
-        - WhatIf/Confirm support
-        - Structured logging
+    1.1.0 - 05/15/2026 - Initial release
+        - Full resource-group teardown
+        - Selective per-resource teardown via -Selective
+        - Key Vault soft-delete handling and optional purge
+        - Resource lock detection and optional removal via -RemoveLocks
+        - Production subscription gate via -AcknowledgeProductionRisk
+        - Local artifact cleanup via -RemoveLocalArtifacts
+        - Async resource group deletion with progress polling
 
 .LINK
     https://github.com/JONeillSr/
@@ -295,7 +277,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ScriptVersion = "1.1.4"
+$ScriptVersion = "1.2.0"
 $LogFile = Join-Path $PSScriptRoot "Remove-ERPNextAzureDeployment_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 Write-Host "===============================================================" -ForegroundColor Yellow
@@ -310,7 +292,7 @@ Write-Host ""
 function Write-LogMessage {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)] [string]$Message,
+        [Parameter(Mandatory)] [AllowEmptyString()] [string]$Message,
         [Parameter()] [ValidateSet('Info','Success','Warning','Error','Debug')] [string]$Level = 'Info'
     )
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
