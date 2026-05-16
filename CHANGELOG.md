@@ -6,6 +6,86 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.5.6] - 2026-05-16
+
+### Added (Remove-ERPNextAzureDeployment.ps1 → 1.2.2)
+
+- **Orphaned soft-deleted Key Vault warning.** After deleting a Resource Group, the teardown now scans for Key Vaults that were in that RG and are now in Azure's soft-deleted state. If any are found AND the user didn't pass `-PurgeKeyVault`, a yellow warning block appears in the summary explaining what's reserved, why a future deploy will collide, and the exact command to purge.
+
+  Sample output:
+  ```
+  ---------------------------------------------------------------
+  NOTE: Soft-deleted Key Vault(s) remain
+  ---------------------------------------------------------------
+    JTC-prod-eastus-kv
+
+    These vault names are reserved for 90 days by Azure's soft-delete.
+    Re-deploying with the same name will fail until they are purged.
+
+    To purge, re-run this script with:
+      .\Remove-ERPNextAzureDeployment.ps1 -Force `
+          -KeyVaultName 'JTC-prod-eastus-kv' -PurgeKeyVault
+
+    Or via Azure portal: Key Vault service > Manage deleted vaults
+  ---------------------------------------------------------------
+  ```
+
+  Purging remains opt-in (because it's irreversible), but the user is no longer surprised when the next deploy fails with a name-collision error.
+
+- Deploy script version bumped to 1.5.6 for bundle alignment; no functional changes.
+
+---
+
+## [1.5.5] - 2026-05-16
+
+### Fixed
+
+- **Teardown silently skipped the actual Resource Group deletion.** The `Remove-AzResourceGroup -AsJob` polling loop checked `while ($rgJob.State -eq 'Running')`, but the job starts in state `NotStarted` and only transitions to `Running` after the cmdlet begins work. The loop saw `NotStarted`, exited immediately, the script called `Receive-Job` and `Remove-Job -Force` (killing the still-pending job), then reported "Resource Group deleted" — all in under one second. The actual Azure resources were left intact.
+
+  This bug was present in `Remove-ERPNextAzureDeployment.ps1` from 1.1.0 onward but only surfaced now. Earlier teardown runs in this conversation worked because the job happened to transition through `Running` quickly enough that the loop's first iteration caught it. The behavior is timing-sensitive and unreliable.
+
+- **The fix:** The loop now waits while state is in any *non-terminal* state (anything other than `Completed`, `Failed`, `Stopped`), explicitly handles the `Failed` state by surfacing job errors, and **verifies the RG is actually gone via `Get-AzResourceGroup` before reporting success**. The verification step catches any future cmdlet quirk where the job might report `Completed` without having done its work.
+
+### How to spot this bug if you suspect it
+
+Real RG deletions with a VM in them take 3-10 minutes minimum. If your teardown script reports "Resource Group deleted" in less than 30 seconds, something's wrong — verify with `Get-AzResourceGroup -Name <name>` afterward.
+
+---
+
+## [1.5.4] - 2026-05-16
+
+### Fixed
+
+- **`bench setup production` must be run TWICE on Ubuntu 24.04.** The first invocation generates supervisor and nginx config files in `frappe-bench/config/` but returns exit 0 *before* creating the `/etc/supervisor/conf.d/` symlink, running `supervisorctl reread/update`, or finalizing the nginx config. The second invocation picks up where the first left off and completes the work. Both runs return exit 0 so `set -euo pipefail` cannot catch the silent half-completion.
+
+  Without the second run, `supervisorctl status` shows no Frappe groups exist at all, gunicorn never starts, port 8000 is never listening, and nginx serves the "Sorry! We will be back soon" maintenance page to every request. The install reports success while ERPNext is unreachable.
+
+- **Home directory permissions are now adjusted BETWEEN the two `bench setup production` runs**, not after, so that the nginx reload triggered by the second run can actually traverse `/home/${ADMIN_USER}`. Ubuntu 24.04 ships home dirs at mode 750; nginx (as `www-data`) needs at least `o+x` to reach the bench's `sites/.../public/` directory.
+
+- **Removed the `bench setup nginx --yes` step.** It was redundant with `bench setup production` (which already runs the nginx setup internally as part of its workflow) and didn't help. The cleaner pattern is just: run `bench setup production` twice, do the chmod between them, then poll for port 8000.
+
+- **Removed the manual supervisor-start logic from 1.5.3.** I had targeted the wrong supervisor group names (`frappe-bench-frappe-web:*` instead of `frappe-bench-web`). The correct names per the bench-generated supervisor.conf are `frappe-bench-redis`, `frappe-bench-web`, and `frappe-bench-workers`. But with the double-invocation fix in place, supervisor is brought up correctly by bench itself — we don't need to manage it manually at all.
+
+### What the user sees now
+
+After v1.5.4, an end-to-end deploy completes when port 8000 is verified up. Hitting `http://<public-ip>` after the script declares success returns the ERPNext login page. The "Sorry! We will be back soon" failure mode is closed.
+
+### Diagnosis trail
+
+Pre-existing VMs from earlier 1.5.x runs can be remediated without a re-deploy by running `bench setup production jtadmin --yes` manually on the VM. The script's second pass is equivalent to the user manually running this remediation command. Future deploys via v1.5.4 won't need manual intervention.
+
+---
+
+## [1.5.3] - 2026-05-16
+
+### Attempted (incomplete fix)
+
+- Targeted the wrong supervisor group names when trying to manually start Frappe processes after `bench setup production`. The supervisor groups are `frappe-bench-redis`, `frappe-bench-web`, and `frappe-bench-workers` — not `frappe-bench-frappe-web:*` and friends. v1.5.3 ran `supervisorctl start` against names that didn't exist and silently failed.
+- Also tried to fix this by chmod-ing the home directory and running `supervisorctl reread/update`. The reread/update was actually a no-op because bench setup production hadn't yet written the supervisor config files in the right place.
+- v1.5.4 supersedes this with the correct fix: run `bench setup production` twice, which is what the bench command does on its own when invoked a second time.
+
+---
+
 ## [1.5.2] - 2026-05-16
 
 ### Fixed
@@ -426,6 +506,10 @@ The 1.4.0 script started Redis on 11000 (succeeded), 13000 (succeeded via the "c
 
 ---
 
+[1.5.6]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.5...v1.5.6
+[1.5.5]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.4...v1.5.5
+[1.5.4]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.3...v1.5.4
+[1.5.3]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/JONeillSr/erpnext-azure/compare/v1.4.7...v1.5.0

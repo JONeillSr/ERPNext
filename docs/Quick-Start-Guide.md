@@ -3,8 +3,8 @@
 
 **Author:** John O'Neill Sr.
 **Company:** Azure Innovators
-**Updated:** 05/15/2026
-**Script Version:** 1.1.0
+**Updated:** 05/16/2026
+**Script Version:** 1.5.0
 
 ---
 
@@ -24,18 +24,29 @@ A complete ERPNext deployment and WooCommerce integration package:
 
 ---
 
-## What's New in 1.1.0
+## What's New in 1.5.0
 
-The deployment script is now **end-to-end**. You no longer need to manually SCP and SSH the install script onto the VM — that happens automatically via `Invoke-AzVMRunCommand`. You can still skip the install with `-SkipInstall` if you want to run it manually.
+End-to-end deployment is now genuinely reliable. Headline changes since 1.1.0:
 
-Other improvements:
-- All passwords now dynamically generated (no hardcoded defaults in the install script)
+- **Multi-tenant safety.** New `-TenantId`, `-SubscriptionId`, `-SelectContext`, and `-ConfirmContext` parameters protect you from deploying into the wrong client's tenant when you're authenticated against several. The script will refuse to proceed without explicit confirmation when ambiguity exists.
+- **Key Vault auto-RBAC.** When you pass `-UseKeyVault`, the script creates the vault, grants you the Key Vault Secrets Officer role automatically, polls for RBAC propagation, and self-heals from stale Az token cache issues. You no longer need to pre-provision permissions on the vault.
+- **Real install success detection.** The bash install on the VM emits a sentinel line only after every step completes. The deploy script scans for that sentinel before declaring success, so silent failures mid-install no longer get reported as "deployed successfully."
+- **Diagnostic dumps on failure.** When the install does fail, you get the last 50 lines of stdout, all stderr, and the exact command to retrieve the full log from the VM, all surfaced in the deploy output.
+- **Frappe v15 install fixes.** Dynamic Redis discovery (port assignments and config files vary between Frappe versions), proper Redis startup before `bench new-site`, and supervisor handoff after site creation.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history including the patch-level debugging story that produced these capabilities.
+
+---
+
+## Earlier Highlights (from 1.1.0)
+
+- Deployment is **end-to-end** — no manual SCP/SSH; install runs automatically via `Invoke-AzVMRunCommand`. Use `-SkipInstall` to defer
+- All passwords dynamically generated (no hardcoded defaults)
 - Optional Azure Key Vault storage for secrets (`-UseKeyVault`)
 - Optional SSH key authentication (`-UseSSHKey`)
 - Optional source-IP restriction on NSG rules (`-AllowedSourceCIDR`)
 - Idempotent — safe to re-run if a deployment fails partway through
-- Node.js 20 LTS (was 18, now EOL)
-- Ubuntu 24.04 alignment throughout
+- Node.js 20 LTS, Ubuntu 24.04 alignment throughout
 
 ---
 
@@ -362,5 +373,5 @@ Import-ERPNextCategories.ps1                Category import script
 
 ---
 
-**Quick Start Guide Version:** 1.1.0
+**Quick Start Guide Version:** 1.5.0
 **Last Updated:** 05/15/2026
