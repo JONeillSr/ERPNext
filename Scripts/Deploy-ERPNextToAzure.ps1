@@ -165,7 +165,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      02/17/2026
-    Version:          1.3.4
+    Version:          1.4.0
     Last Modified:    05/15/2026
     GitHub:           https://github.com/JONeillSr/
 
@@ -188,6 +188,24 @@
         - Total:                 ~$100/month
 
 .CHANGELOG
+    1.4.0 - 05/16/2026 - Fixed install failure + silent-success detection
+        - Fixed Redis connection refused during bench new-site. Frappe needs
+          three private Redis instances (ports 11000/12000/13000 for queue,
+          cache, and socketio) running before new-site can succeed. These
+          are NOT the system-level redis-server on 6379. The install script
+          now starts them in the background between bench init and new-site,
+          waits for them to actually accept connections, then hands them
+          off to supervisor management via bench setup production.
+        - Fixed silent install failures being reported as success. Run
+          Command's outer Status only reports whether the bash script was
+          delivered and executed, not its exit code. The install script
+          now emits a sentinel line "ERPNEXT_INSTALL_STATUS=SUCCESS" only
+          if every step completed, and the deploy script scans stdout for
+          that sentinel before reporting success.
+        - On install failure, the deploy now dumps the last 50 lines of
+          stdout plus all stderr, and shows the exact Invoke-AzVMRunCommand
+          to retrieve the full install log from the VM.
+
     1.3.4 - 05/15/2026 - Probe secret name compliance
         - Fixed: probe secret name contained underscores, which Key Vault
           rejects. Secret names must match ^[0-9a-zA-Z-]+$ (alphanumerics
@@ -349,7 +367,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 # Script configuration
-$ScriptVersion = "1.3.4"
+$ScriptVersion = "1.4.0"
 $CompanyName = "JT Custom Trailers"
 $LogFile = Join-Path $PSScriptRoot "Deploy-ERPNextToAzure_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
@@ -959,23 +977,52 @@ function Invoke-VMInstallation {
     $result = Receive-Job -Job $job -ErrorAction Continue
     Remove-Job -Job $job -Force
 
+    # Run Command's outer Status reports whether the bash script was DELIVERED and
+    # EXECUTED, not whether it succeeded. A bash script that exits 1 still returns
+    # Status=Succeeded from Run Command's perspective. We must inspect the output
+    # for our sentinel line "ERPNEXT_INSTALL_STATUS=SUCCESS" which the script only
+    # emits if everything completed.
     if ($result.Status -ne 'Succeeded') {
-        Write-LogMessage "Run Command status: $($result.Status)" -Level Error
+        Write-LogMessage "Run Command itself failed: $($result.Status)" -Level Error
         if ($result.Value) {
             foreach ($v in $result.Value) {
                 Write-LogMessage "[$($v.Code)] $($v.Message)" -Level Error
             }
         }
-        throw "ERPNext installation failed."
+        throw "ERPNext installation Run Command failed."
     }
 
-    Write-LogMessage "Installation completed successfully." -Level Success
+    # Concatenate all output channels for sentinel scan and diagnostic dumping.
+    $stdoutText = ""
+    $stderrText = ""
     if ($result.Value) {
         foreach ($v in $result.Value) {
-            Write-LogMessage "[$($v.Code)] $($v.Message)" -Level Debug
+            if ($v.Code -like '*StdOut*') { $stdoutText += $v.Message }
+            elseif ($v.Code -like '*StdErr*') { $stderrText += $v.Message }
         }
     }
 
+    if ($stdoutText -notmatch 'ERPNEXT_INSTALL_STATUS=SUCCESS') {
+        Write-LogMessage "Installation did NOT reach the success sentinel." -Level Error
+        Write-LogMessage "This means the bash script exited before completing all steps." -Level Error
+        Write-LogMessage "" -Level Error
+        Write-LogMessage "=== Last 50 lines of stdout from the VM: ===" -Level Error
+        $tailOut = ($stdoutText -split "`n" | Where-Object { $_ } | Select-Object -Last 50) -join "`n"
+        Write-LogMessage $tailOut -Level Error
+        if ($stderrText.Trim()) {
+            Write-LogMessage "" -Level Error
+            Write-LogMessage "=== Stderr from the VM: ===" -Level Error
+            Write-LogMessage $stderrText -Level Error
+        }
+        Write-LogMessage "" -Level Error
+        Write-LogMessage "Full install log on the VM: /var/log/erpnext-install.log" -Level Error
+        Write-LogMessage "Retrieve with:" -Level Error
+        Write-LogMessage "  Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroup -VMName $VMName ``" -Level Error
+        Write-LogMessage "    -CommandId RunShellScript -ScriptString 'tail -200 /var/log/erpnext-install.log'" -Level Error
+        throw "ERPNext installation did not complete - sentinel not found in output."
+    }
+
+    Write-LogMessage "Installation completed successfully (sentinel confirmed)." -Level Success
     return $result
 }
 
@@ -1224,25 +1271,25 @@ try {
         "ERPNEXT_ADMIN_PW='$erpAdminPassword'",
         "PUBLIC_IP='$publicIpAddress'",
         '',
-        'echo "[1/9] Updating system packages..."',
+        'echo "[1/10] Updating system packages..."',
         'export DEBIAN_FRONTEND=noninteractive',
         'sudo -E apt-get update',
         'sudo -E apt-get upgrade -y',
         '',
-        'echo "[2/9] Installing prerequisites..."',
+        'echo "[2/10] Installing prerequisites..."',
         'sudo -E apt-get install -y git python3-dev python3-pip python3-venv python3-setuptools \',
         '    redis-server mariadb-server mariadb-client libmariadb-dev \',
         '    nginx supervisor curl wget xvfb libfontconfig xfonts-75dpi xfonts-base \',
         '    software-properties-common build-essential',
         '',
-        'echo "[3/9] Securing MariaDB..."',
+        'echo "[3/10] Securing MariaDB..."',
         'sudo mysql -e "ALTER USER ''root''@''localhost'' IDENTIFIED BY ''${MARIADB_ROOT_PW}'';"',
         'sudo mysql -u root -p"${MARIADB_ROOT_PW}" -e "DELETE FROM mysql.user WHERE User='''';"',
         'sudo mysql -u root -p"${MARIADB_ROOT_PW}" -e "DELETE FROM mysql.user WHERE User=''root'' AND Host NOT IN (''localhost'',''127.0.0.1'',''::1'');"',
         'sudo mysql -u root -p"${MARIADB_ROOT_PW}" -e "DROP DATABASE IF EXISTS test;"',
         'sudo mysql -u root -p"${MARIADB_ROOT_PW}" -e "FLUSH PRIVILEGES;"',
         '',
-        'echo "[4/9] Tuning MariaDB for ERPNext..."',
+        'echo "[4/10] Tuning MariaDB for ERPNext..."',
         'sudo tee /etc/mysql/mariadb.conf.d/60-erpnext.cnf > /dev/null <<''EOF''',
         '[mysqld]',
         'character-set-client-handshake = FALSE',
@@ -1259,33 +1306,73 @@ try {
         'EOF',
         'sudo systemctl restart mariadb',
         '',
-        'echo "[5/9] Installing Node.js 20 LTS and Yarn..."',
+        'echo "[5/10] Installing Node.js 20 LTS and Yarn..."',
         'curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -',
         'sudo -E apt-get install -y nodejs',
         'sudo npm install -g yarn',
         '',
-        'echo "[6/9] Installing wkhtmltopdf (Ubuntu 24.04 noble build)..."',
+        'echo "[6/10] Installing wkhtmltopdf (Ubuntu 24.04 noble build)..."',
         'WKHTMLTOPDF_DEB=wkhtmltox_0.12.6.1-3.jammy_amd64.deb',
         'cd /tmp',
         'wget -q "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/${WKHTMLTOPDF_DEB}"',
         'sudo apt-get install -y "./${WKHTMLTOPDF_DEB}"',
         'rm -f "${WKHTMLTOPDF_DEB}"',
         '',
-        'echo "[7/9] Installing Frappe Bench..."',
+        'echo "[7/10] Installing Frappe Bench..."',
         'sudo pip3 install --break-system-packages frappe-bench',
         '',
-        'echo "[8/9] Initializing Frappe + ERPNext..."',
+        'echo "[8/10] Initializing Frappe Bench and pulling apps..."',
         'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER} && bench init --frappe-branch version-15 frappe-bench"',
         'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench get-app erpnext --branch version-15"',
         'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench get-app hrms --branch version-15"',
+        '',
+        '# CRITICAL: Frappe needs three Redis instances running on ports 11000, 12000, 13000',
+        '# (queue, cache, socketio) before "bench new-site" can succeed. These are NOT the',
+        '# system-level redis-server on port 6379 - they are bench-managed instances whose',
+        '# configs are generated by "bench init" in config/redis_*.conf.',
+        '# We start them in the background here, run new-site, then they will be migrated',
+        '# to supervisor management by "bench setup production" at the end.',
+        'echo "[8a/10] Starting Frappe-managed Redis instances..."',
+        'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && nohup redis-server config/redis_queue.conf >/tmp/redis_queue.log 2>&1 &"',
+        'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && nohup redis-server config/redis_cache.conf >/tmp/redis_cache.log 2>&1 &"',
+        'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && nohup redis-server config/redis_socketio.conf >/tmp/redis_socketio.log 2>&1 &"',
+        '',
+        '# Wait for the Redis instances to actually accept connections before proceeding.',
+        '# Without this we hit Connection refused errors in bench new-site.',
+        'echo "[8b/10] Waiting for Redis instances to be ready..."',
+        'for port in 11000 12000 13000; do',
+        '    for i in $(seq 1 30); do',
+        '        if redis-cli -p $port ping 2>/dev/null | grep -q PONG; then',
+        '            echo "  Redis on port $port is up."',
+        '            break',
+        '        fi',
+        '        sleep 1',
+        '        if [ $i -eq 30 ]; then',
+        '            echo "  ERROR: Redis on port $port did not start within 30s." >&2',
+        '            exit 1',
+        '        fi',
+        '    done',
+        'done',
+        '',
+        'echo "[9/10] Creating site and installing apps..."',
         'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench new-site jtcustomtrailers.local --mariadb-root-password ''${MARIADB_ROOT_PW}'' --admin-password ''${ERPNEXT_ADMIN_PW}''"',
         'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench --site jtcustomtrailers.local install-app erpnext"',
         'sudo -u "${ADMIN_USER}" bash -c "cd /home/${ADMIN_USER}/frappe-bench && bench --site jtcustomtrailers.local install-app hrms"',
         '',
-        'echo "[9/9] Configuring production (Nginx + Supervisor)..."',
+        '# Stop the standalone Redis instances - they will be replaced by supervisor-managed ones.',
+        'echo "[9a/10] Stopping standalone Redis (will be replaced by supervisor)..."',
+        'for port in 11000 12000 13000; do',
+        '    redis-cli -p $port shutdown nosave 2>/dev/null || true',
+        'done',
+        '',
+        'echo "[10/10] Configuring production (Nginx + Supervisor)..."',
         "sudo bash -c `"cd /home/${AdminUsername}/frappe-bench && bench setup production ${AdminUsername} --yes`"",
         "sudo bash -c `"cd /home/${AdminUsername}/frappe-bench && bench setup nginx --yes`"",
         'sudo supervisorctl reload',
+        '',
+        '# Sentinel: this exact line is parsed by the deploy script to confirm real success.',
+        '# If the install bombed earlier, set -euo pipefail will have exited before reaching here.',
+        'echo "ERPNEXT_INSTALL_STATUS=SUCCESS"',
         '',
         'echo ""',
         'echo "================================================================"',
