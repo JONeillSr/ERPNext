@@ -109,8 +109,8 @@
 #>
 
 [CmdletBinding()]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'SaveAs',
-    Justification = 'Used by Set-ContextAndReport via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+    Justification = 'SaveAs is used by Set-ContextAndReport via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage from within nested functions.')]
 param(
     [Parameter()]
     [switch]$ListOnly,

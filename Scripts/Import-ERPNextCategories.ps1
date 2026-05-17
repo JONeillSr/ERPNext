@@ -116,12 +116,8 @@
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'APIKey',
-    Justification = 'Used by Invoke-ERPNextAPI via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'APISecret',
-    Justification = 'Used by Invoke-ERPNextAPI via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'SkipSSLValidation',
-    Justification = 'Used by Invoke-ERPNextAPI via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+    Justification = 'These script-scope parameters (APIKey, APISecret, SkipSSLValidation) are used by Invoke-ERPNextAPI via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage from within nested functions.')]
 param(
     [Parameter(Mandatory)]
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]

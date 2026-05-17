@@ -330,10 +330,8 @@
 [CmdletBinding(SupportsShouldProcess)]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
     Justification = 'All three uses convert dynamically-generated passwords (from New-SecurePassword) or a literal "probe" string into SecureString for Azure API calls that require it (Key Vault, New-AzVM credentials). No hardcoded production secrets.')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'InstallTimeoutMinutes',
-    Justification = 'Used by Invoke-VMInstallation via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
-[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'PrincipalType',
-    Justification = 'Reserved for future Service Principal vs User differentiation in role assignment logic. Documented intent rather than dead code.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '',
+    Justification = 'These script-scope parameters (InstallTimeoutMinutes, PrincipalType) are used by internal functions via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage from within nested functions.')]
 param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
