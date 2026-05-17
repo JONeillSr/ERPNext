@@ -1,7 +1,7 @@
 # ERPNext Azure Deployment Toolkit
 
 End-to-end PowerShell automation for deploying [ERPNext](https://erpnext.com/) on Microsoft Azure, with WooCommerce category import and integration guidance.
-
+[![PSScriptAnalyzer](https://github.com/JONeillSr/ERPNext/actions/workflows/lint.yml/badge.svg)](https://github.com/JONeillSr/ERPNext/actions/workflows/lint.yml)
 [![PowerShell](https://img.shields.io/badge/PowerShell-7.2%2B-5391FE.svg)](https://github.com/PowerShell/PowerShell)
 [![Azure](https://img.shields.io/badge/Azure-Compatible-0078D4.svg)](https://azure.microsoft.com/)
 [![ERPNext](https://img.shields.io/badge/ERPNext-v15-1F8FE5.svg)](https://erpnext.com/)
