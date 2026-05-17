@@ -116,6 +116,12 @@
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'APIKey',
+    Justification = 'Used by Invoke-ERPNextAPI via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'APISecret',
+    Justification = 'Used by Invoke-ERPNextAPI via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'SkipSSLValidation',
+    Justification = 'Used by Invoke-ERPNextAPI via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
 param(
     [Parameter(Mandatory)]
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
@@ -189,7 +195,7 @@ function Write-LogMessage {
     }
     Write-Host $line -ForegroundColor $color
 
-    try { Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue } catch { }
+    try { Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue } catch { Write-Verbose "Suppressed (non-fatal): $_" }
 }
 
 function Get-PropertyOrDefault {
@@ -311,7 +317,7 @@ function Get-ERPNextItemGroup {
 }
 
 function New-ERPNextItemGroup {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)] [hashtable]$ItemGroup
     )

@@ -109,6 +109,8 @@
 #>
 
 [CmdletBinding()]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'SaveAs',
+    Justification = 'Used by Set-ContextAndReport via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
 param(
     [Parameter()]
     [switch]$ListOnly,
@@ -142,7 +144,6 @@ function Write-ContextTable {
     )
 
     Write-Host ""
-    $width = 1 + 1 + 4 + 1 + 40 + 1 + 36 + 1 + 36
     $header = ('  {0,-4} {1,-40} {2,-36} {3,-36}' -f '#', 'Subscription', 'Subscription ID', 'Tenant ID')
     Write-Host $header -ForegroundColor Cyan
     Write-Host ('  ' + ('-' * ($header.Length - 2))) -ForegroundColor DarkGray
@@ -164,6 +165,7 @@ function Write-ContextTable {
 }
 
 function Set-ContextAndReport {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)] $TargetSubscription
     )

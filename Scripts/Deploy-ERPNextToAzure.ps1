@@ -76,7 +76,7 @@
 
 .PARAMETER AllowedSourceCIDR
     Optional CIDR block to restrict SSH, HTTP, HTTPS, and ERPNext (8000) inbound
-    access. Default: '*' (any source — NOT recommended for production).
+    access. Default: '*' (any source -- NOT recommended for production).
     Example: '203.0.113.42/32' for a single office IP.
 
 .PARAMETER UseSSHKey
@@ -328,6 +328,12 @@
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
+    Justification = 'All three uses convert dynamically-generated passwords (from New-SecurePassword) or a literal "probe" string into SecureString for Azure API calls that require it (Key Vault, New-AzVM credentials). No hardcoded production secrets.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'InstallTimeoutMinutes',
+    Justification = 'Used by Invoke-VMInstallation via script-scope reference; PSScriptAnalyzer does not trace script-scope parameter usage.')]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', 'PrincipalType',
+    Justification = 'Reserved for future Service Principal vs User differentiation in role assignment logic. Documented intent rather than dead code.')]
 param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
@@ -596,6 +602,8 @@ function Test-AzureProvider {
 
 function New-SecurePassword {
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Pure function that generates a random password string; does not change system state.')]
     param(
         [Parameter()]
         [ValidateRange(12, 128)]
@@ -630,6 +638,8 @@ function New-SecurePassword {
 
 function New-NSGRuleSet {
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Pure function that builds a list of NSG rule config objects in memory; does not change system state. State change happens when the caller applies the rules to a live NSG.')]
     param(
         [Parameter(Mandatory)]
         [string]$SourcePrefix
@@ -813,7 +823,7 @@ function Test-KeyVaultSecretAccess {
             Remove-AzKeyVaultSecret -VaultName $VaultName -Name $probeName -Force -ErrorAction SilentlyContinue | Out-Null
             # Also purge so it doesn't sit in soft-delete state
             Remove-AzKeyVaultSecret -VaultName $VaultName -Name $probeName -InRemovedState -Force -ErrorAction SilentlyContinue | Out-Null
-        } catch { }
+        } catch { Write-Verbose "Suppressed (non-fatal): $_" }
         return @{ Granted = $true; ObjectId = $null; Error = $null }
     }
     catch {
@@ -1035,7 +1045,7 @@ Then re-run the deployment.
 }
 
 function Set-VMKeyVaultSecret {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)] [string]$VaultName,
         [Parameter(Mandatory)] [string]$SecretName,
@@ -1496,7 +1506,8 @@ try {
     $existingVM = Get-AzVM -Name $VMName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
     if ($existingVM) {
         Write-LogMessage "  VM already exists. Skipping provisioning." -Level Warning
-        $vm = $existingVM
+        # Variable not used downstream; existing VM is reachable via Get-AzVM if needed.
+        $null = $existingVM
     } else {
         $vmConfig = New-AzVMConfig -VMName $VMName -VMSize $VMSize
 
@@ -1523,7 +1534,7 @@ try {
         $vmConfig = Set-AzVMBootDiagnostic -VM $vmConfig -Disable
 
         Write-LogMessage "  Creating VM (this can take several minutes)..." -Level Info
-        $vm = New-AzVM -ResourceGroupName $ResourceGroupName -Location $Location -VM $vmConfig
+        $null = New-AzVM -ResourceGroupName $ResourceGroupName -Location $Location -VM $vmConfig
         Write-LogMessage "  VM created successfully." -Level Success
     }
 

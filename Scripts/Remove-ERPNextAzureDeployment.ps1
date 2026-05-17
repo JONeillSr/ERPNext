@@ -337,7 +337,7 @@ function Write-LogMessage {
         'Debug'   { 'DarkGray' }
     }
     Write-Host $line -ForegroundColor $color
-    try { Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false } catch { }
+    try { Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false } catch { Write-Verbose "Suppressed (non-fatal): $_" }
 }
 
 function Select-AzureContext {
@@ -451,7 +451,7 @@ function Test-ProductionSubscription {
 }
 
 function Remove-ResourceLock {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)] [string]$ResourceGroup
     )
@@ -488,7 +488,7 @@ function Remove-ResourceLock {
 }
 
 function Remove-ResourceIfExists {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)] [string]$ResourceType,   # display label only
         [Parameter(Mandatory)] [string]$Name,
@@ -579,7 +579,7 @@ function Invoke-SelectiveTeardown {
 }
 
 function Remove-KeyVaultWithOptionalPurge {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)] [string]$VaultName,
         [Parameter(Mandatory)] [string]$ResourceGroup
@@ -652,7 +652,7 @@ function Remove-KeyVaultWithOptionalPurge {
                         # Az background jobs need their own context; copy from parent token cache
                         try {
                             $null = Set-AzContext -Tenant $TenantId -SubscriptionId $SubId -ErrorAction SilentlyContinue
-                        } catch { }
+                        } catch { Write-Verbose "Suppressed (non-fatal): $_" }
                         Remove-AzKeyVault -VaultName $VaultName -Location $Location -InRemovedState -Force
                     } -ArgumentList $VaultName, $purgeVaultLocation, (Get-AzContext).Subscription.Id, (Get-AzContext).Tenant.Id
 
@@ -731,7 +731,7 @@ function Remove-KeyVaultWithOptionalPurge {
 }
 
 function Remove-LocalArtifacts {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param()
 
     $results = @()
@@ -928,7 +928,7 @@ try {
                     # Set it before calling cmdlets that need authentication.
                     try {
                         $null = Set-AzContext -Tenant $TenantId -SubscriptionId $SubId -ErrorAction SilentlyContinue
-                    } catch { }
+                    } catch { Write-Verbose "Suppressed (non-fatal): $_" }
                     Remove-AzResourceGroup -Name $RGName -Force -Confirm:$false
                 } -ArgumentList $ResourceGroupName, $context.Subscription.Id, $context.Tenant.Id
 
