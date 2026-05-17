@@ -6,6 +6,159 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.6.5] - 2026-05-16
+
+### Improved
+
+- **Pre-flight check for subnet-fits-in-VNet.** When using `-ExistingVNetName`, the script now verifies that the requested `-SubnetAddressPrefix` actually fits inside the VNet's address space *before* attempting to add the subnet via the Azure API. Previously, a mismatch produced a cryptic Azure error (`NetcfgSubnetRangeOutsideVnet`) mid-deployment.
+
+  The new check inspects all VNet address prefixes (a VNet can have multiple), confirms at least one prefix is broad enough to contain the requested subnet, and if none qualifies, throws a clear error with the exact PowerShell commands to expand the VNet's address space. The expansion command is non-disruptive — existing subnets and resources are unaffected when you add an additional prefix to a VNet.
+
+  Example improved error message:
+  ```
+  Requested subnet 10.0.2.0/27 does not fit inside the VNet's address space (10.0.0.0/23).
+  Either pass -SubnetAddressPrefix with a CIDR inside that range, or expand the VNet's
+  address space first with:
+
+    $vnet = Get-AzVirtualNetwork -Name 'jtcustomtr-2e886f0313-vnet' -ResourceGroupName 'JTC-Prod-WP-WestUS2-rg'
+    $vnet.AddressSpace.AddressPrefixes.Add('10.0.2.0/24')
+    $vnet | Set-AzVirtualNetwork
+
+  Then re-run this deploy. Expanding a VNet's address space is non-disruptive - existing
+  subnets and resources are unaffected.
+  ```
+
+### Why this matters for hub-spoke / shared-VNet topologies
+
+When ERPNext deploys into a VNet owned by another team or service, the VNet's address space was sized for that other workload. Adding an ERPNext subnet might or might not fit. The pre-flight check turns a 30-second confusing failure into immediate, actionable guidance.
+
+---
+
+## [1.6.4] - 2026-05-16
+
+### Fixed
+
+- **Test-CIDROverlap still crashing in v1.6.3** with the same `Cannot convert value "-1" to type "System.UInt64"` error, despite the rewrite to "uint64 throughout." The root cause turned out to be PowerShell's hex-literal parsing: `[uint64]0xFFFFFFFF` doesn't do what it looks like. PowerShell parses `0xFFFFFFFF` first as the *narrowest* numeric type that fits (which is `[int]` interpreted as a signed value, giving `-1` since the high bit is set), then casts that `-1` to `[uint64]`. The cast goes through .NET's numeric conversion which throws because `-1` isn't representable as an unsigned type.
+
+- **The fix has two parts:**
+  1. **Replaced hex literals with decimal:** `[uint64]4294967295` instead of `[uint64]0xFFFFFFFF`. Decimal literals avoid the parser-narrowing trap entirely.
+  2. **Replaced bitshift operators with multiplication:** instead of `($byte -shl 24)`, the code now does `($byte * 16777216)`. Mathematically identical but bypasses PowerShell's operator precedence around mixed-type shifts, which is where intermediate signed values were creeping in.
+
+- **Made the overlap check non-fatal:** wrapped the `Test-CIDROverlap` call in a try/catch. If the helper math fails for any future reason, the script logs a warning and proceeds. Azure's API has its own overlap validation; the helper is a nice-to-have early-warning, not a safety-critical check. The deployment shouldn't abort because of a pre-check helper bug.
+
+### Why this took two attempts to fix
+
+PowerShell's numeric type system is full of subtle traps when mixing integer widths. The first attempt assumed that "casting to `[uint64]` is enough"; in reality, the cast happens *after* the literal has already been narrowed to a problematic intermediate type. The lesson: avoid hex literals in PowerShell numeric math entirely; use decimal, and prefer arithmetic (`*`, `+`) over bitwise (`-shl`, `-bor`, `-bnot`) when working with values that span integer widths.
+
+---
+
+## [1.6.3] - 2026-05-16
+
+### Fixed
+
+- **`Test-CIDROverlap` crashed on every invocation with `Cannot convert value "-1" to type "System.UInt64"`.** The function used PowerShell's `-bnot` operator on a `[uint32]` mask to compute the host portion of an address range. PowerShell's `-bnot` doesn't preserve unsigned semantics — when applied to `[uint32]0`, it returns the signed integer `-1`, not the unsigned `0xFFFFFFFF` that the math needs. Subsequent operations tried to convert `-1` to `[uint64]` (because PowerShell widens to the larger type in mixed operations) and threw an exception, taking down the entire subnet-creation step in PrivateOnly+ExistingVNet mode.
+
+- **The fix:** rewrote the address-range computation using arithmetic instead of bitwise complement. The new logic: `blockSize = 2^hostBits`, `mask = 0xFFFFFFFF - (blockSize - 1)`, `end = start + blockSize - 1`. All math happens in `[uint64]` which has plenty of headroom for any 32-bit IPv4 arithmetic and never produces negative intermediates.
+
+- **Verified against six test cases** including the actual JTC scenarios (`10.0.2.0/27` vs `10.0.0.0/25` WordPress appsubnet, vs `10.0.1.0/25` dbsubnet), edge cases (fully contained `/16` in `/8`, adjacent `/27`s that don't overlap, partial overlap of `/27` with `/28`), and trivial cases. All correct.
+
+### Why this bug existed
+
+The original implementation was modeled on a C-style bitwise mask computation that works fine in any language with proper unsigned types. PowerShell's mixed-type arithmetic and the way it handles `-bnot` on unsigned values isn't well-documented and the breakage isn't visible until runtime. The arithmetic-based replacement is also clearer to read.
+
+---
+
+## [1.6.2] - 2026-05-16
+
+### Quality of life
+
+- **Auto-rename RG/VM when location changes.** When `-Location` is set to anything other than `eastus` and the user accepts the default `-ResourceGroupName` and `-VMName`, the script now substitutes the new location into those names (e.g., `JTC-prod-erpnext-eastus-rg` → `JTC-prod-erpnext-westus2-rg`). Previously, deploying to westus2 with default names produced resources named `*-eastus-*` in westus2, which was technically functional but confusing in the portal and inconsistent with the rest of the naming convention. Users who pass explicit `-ResourceGroupName` and `-VMName` are unaffected.
+- Fixed the in-script `.EXAMPLE` for private-network deployment that incorrectly showed `-Region 'westus2'` (which would have failed — the actual parameter name is `-Location`).
+
+---
+
+## [1.6.1] - 2026-05-16
+
+### Fixed (Remove-ERPNextAzureDeployment.ps1 → 1.3.1)
+
+- **Teardown hung in `Blocked` state when `Remove-AzResourceGroup -AsJob` was launched.** PowerShell background-job runspaces do **not** inherit `$ConfirmPreference` or `$PSDefaultParameterValues` from the parent session. Even though the teardown script sets `$ConfirmPreference = 'None'` at the top when `-Force` is passed, the `-AsJob` runspace started fresh with `ConfirmPreference = 'High'`. The cmdlet inside the job tried to prompt for confirmation, the prompt had nowhere to go (no console attached to the job), and the job sat in `Blocked` state indefinitely.
+
+  The v1.2.1 fix from earlier today addressed a *different* bug in the same area (polling for the wrong state name), but did not address the underlying confirmation-suppression issue in the job runspace. That bug only manifested when the job's runspace defaults didn't happen to match what the cmdlet needed.
+
+- **The fix:** replaced `Remove-AzResourceGroup -AsJob` with `Start-Job -ScriptBlock { ... }`. The script block explicitly sets `$ConfirmPreference = 'None'` and `$PSDefaultParameterValues['*:Confirm'] = $false` *inside the runspace* before calling the cmdlet. The block also re-imports `Az.Resources` and `Az.Accounts` and sets the Az context explicitly, since the job runspace has neither of those by default.
+
+- **Added a `Blocked`-state guard:** if the job sits in `Blocked` state for more than 2 minutes, the script now aborts with a clear error message and the synchronous-fallback command for the operator to run. This prevents an infinite poll loop in case some future scenario introduces a different prompt-suppression failure.
+
+### Why this was timing-sensitive
+
+`Remove-AzResourceGroup -AsJob` does *some* of its setup work in the parent runspace before delegating to the background runspace. Whether that included consuming `-Force` and `-Confirm:$false` flags before the runspace boundary, or after, appears to vary by Az.Resources version. v1.2.1 was tested with a session where the flags were honored; this session got the unlucky path where they weren't.
+
+### Deploy script version bumped to 1.6.1 for bundle alignment
+
+No functional changes in the deploy script. Bundle versions stay aligned so the latest tested deploy + matching teardown ship together.
+
+---
+
+## [1.6.0] - 2026-05-16
+
+**Private network deployment mode.** Add support for deploying ERPNext as a private-only VM with no public IP, designed for production access via Azure VPN Gateway and/or peered VNets. Previous deployments exposed port 80 (and SSH) to the internet with NSG source-IP restriction; this release adds a fully private deployment path that's reachable only from inside the VNet.
+
+### Deploy-ERPNextToAzure.ps1 → 1.6.0
+
+**New parameters:**
+
+- `-PrivateOnly` — skip public IP creation entirely. NSG rules tighten to allow inbound only from the `VirtualNetwork` service tag (which automatically includes the VNet's own address space, all peered VNets, and any VPN client address pools — so peering or VPN access "just works" without rule updates).
+
+- `-ExistingVNetName` — join an existing VNet rather than creating a fresh one. Use this to put ERPNext in the same network as other services it needs to talk to (e.g., a WordPress App Service with VNet integration, a MySQL Flexible Server).
+
+- `-ExistingVNetResourceGroup` — for when the existing VNet lives in a different RG than where you want ERPNext deployed. Common pattern: VNet in a shared infrastructure RG, ERPNext in its own dedicated RG. The script validates that the VNet's region matches the deployment region and refuses to proceed if they don't.
+
+- `-SubnetName` (default `erpnext-subnet`) — name of the subnet to use within the existing VNet. Reused if it already exists, created if it doesn't.
+
+- `-SubnetAddressPrefix` (default `10.0.2.0/27`) — CIDR for a newly-created subnet. The script validates that the requested prefix doesn't overlap any existing subnet in the target VNet before attempting creation.
+
+**Behavior changes:**
+
+- The VM's NIC is created without a public IP when `-PrivateOnly` is set. The install still works via `Invoke-AzVMRunCommand` because that uses Azure's Resource Manager control plane, not VM networking.
+- The result object now includes both `IPAddressKind` (`Public` or `Private`) and `IPAddress` fields. The legacy `PublicIP` field is preserved for backward compatibility with v1.5.x consumers but is more accurately just "the IP people use to reach ERPNext."
+- Final summary clearly distinguishes private vs public IP and reminds the operator that private IPs require VPN/VNet access.
+
+**Added helper:**
+
+- `Test-CIDROverlap` — pure-PowerShell CIDR overlap detection used to validate new subnet placement against existing subnets in the target VNet. No external dependencies.
+
+### Remove-ERPNextAzureDeployment.ps1 → 1.3.0
+
+When ERPNext is deployed into a shared VNet, the subnet that the script created lives in that VNet's resource group — NOT the ERPNext RG. Deleting the ERPNext RG leaves the subnet behind, blocking future redeployments at the same prefix. New parameters handle this:
+
+- `-ExternalVNetName` / `-ExternalVNetResourceGroup` / `-ExternalSubnetName` — after the RG deletion completes, the script verifies the subnet has no remaining IP configurations attached (sanity check that the RG deletion actually removed the NIC), then removes the subnet from the external VNet.
+
+If any IP configurations are still attached when subnet deletion is attempted, the script refuses to delete and surfaces a warning — that means the RG deletion didn't fully complete and investigation is needed before retry.
+
+### Typical usage going forward
+
+```powershell
+# Private deployment into existing VNet (e.g., shared with WordPress)
+.\Deploy-ERPNextToAzure.ps1 -ConfirmContext `
+    -UseKeyVault -KeyVaultName 'JTC-prod-westus2-kv' `
+    -Region 'westus2' `
+    -PrivateOnly `
+    -ExistingVNetName 'jtcustomtr-2e886f0313-vnet' `
+    -ExistingVNetResourceGroup 'jtcustomtr-rg'
+
+# Matching teardown that cleans up the external subnet too
+.\Remove-ERPNextAzureDeployment.ps1 -Force -RemoveLocalArtifacts `
+    -KeyVaultName 'JTC-prod-westus2-kv' -PurgeKeyVault `
+    -ExternalVNetName 'jtcustomtr-2e886f0313-vnet' `
+    -ExternalVNetResourceGroup 'jtcustomtr-rg'
+```
+
+### Backward compatibility
+
+All new parameters are optional. Existing v1.5.x call patterns continue to work unchanged and produce identical behavior (public IP + fresh isolated VNet). No changes required to consumers of the result object — the `PublicIP` field is preserved alongside the new `IPAddress` / `IPAddressKind` fields.
+
+---
+
 ## [1.5.6] - 2026-05-16
 
 ### Added (Remove-ERPNextAzureDeployment.ps1 → 1.2.2)
@@ -506,6 +659,12 @@ The 1.4.0 script started Redis on 11000 (succeeded), 13000 (succeeded via the "c
 
 ---
 
+[1.6.5]: https://github.com/JONeillSr/erpnext-azure/compare/v1.6.4...v1.6.5
+[1.6.4]: https://github.com/JONeillSr/erpnext-azure/compare/v1.6.3...v1.6.4
+[1.6.3]: https://github.com/JONeillSr/erpnext-azure/compare/v1.6.2...v1.6.3
+[1.6.2]: https://github.com/JONeillSr/erpnext-azure/compare/v1.6.1...v1.6.2
+[1.6.1]: https://github.com/JONeillSr/erpnext-azure/compare/v1.6.0...v1.6.1
+[1.6.0]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.6...v1.6.0
 [1.5.6]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.5...v1.5.6
 [1.5.5]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/JONeillSr/erpnext-azure/compare/v1.5.3...v1.5.4

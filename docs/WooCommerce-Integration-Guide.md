@@ -1,10 +1,22 @@
 # ERPNext - WooCommerce Integration Guide
 ## JT Custom Trailers
 
-**Author:** John O'Neill Sr.  
-**Company:** Azure Innovators  
-**Create Date:** 02/17/2026  
-**Version:** 1.0.0
+**Author:** John O'Neill Sr.
+**Company:** Azure Innovators
+**Original Create Date:** 02/17/2026
+**Last Updated:** 05/16/2026
+**Version:** 2.0.0
+
+---
+
+## What's new in 2.0
+
+This guide has been substantially rewritten since 1.0.0 to reflect changes in both the ERPNext ecosystem and the deployment architecture.
+
+- **Old built-in WooCommerce integration is deprecated.** The Frappe team officially deprecated the WooCommerce integration that shipped with ERPNext v15. The old `bench get-app woocommerceconnector` pattern is no longer the recommended path.
+- **New recommended approach:** the WooCommerce-side ERPNext Integration plugin (installed in WordPress, calls ERPNext via API). This reverses the direction of the integration from how it worked in v14 and earlier — WordPress is now the active party that calls into ERPNext rather than vice versa.
+- **Private-network deployment.** This guide now assumes ERPNext is deployed in private-network mode inside your existing Azure VNet (the same VNet hosting WordPress). The integration uses private IPs over VNet integration — no public internet exposure required.
+- **Hardcoded admin password removed.** The 1.0.0 version of this doc contained a literal password. That has been removed and the doc now teaches the Key Vault retrieval pattern.
 
 ---
 
@@ -12,8 +24,8 @@
 
 1. [Overview](#overview)
 2. [Prerequisites](#prerequisites)
-3. [Integration Methods](#integration-methods)
-4. [Recommended Approach: ERPNext WooCommerce Integration](#recommended-approach)
+3. [Architecture: Private-network integration](#architecture-private-network-integration)
+4. [Integration approach](#integration-approach)
 5. [Setup Instructions](#setup-instructions)
 6. [Data Synchronization](#data-synchronization)
 7. [Category Mapping](#category-mapping)
@@ -27,301 +39,304 @@
 
 ## Overview
 
-This guide explains how to integrate your WordPress/WooCommerce e-commerce site with ERPNext ERP system. The integration will:
+This guide explains how to integrate the JT Custom Trailers WooCommerce site with ERPNext. The integration delivers:
 
-- **Sync products** from ERPNext to WooCommerce
-- **Sync categories** maintaining your existing hierarchy
-- **Update inventory** in real-time across both systems
-- **Import orders** from WooCommerce to ERPNext for processing
-- **Track customer data** centrally in ERPNext
-- **Manage pricing** from ERPNext with sync to WooCommerce
+- **Product sync** from ERPNext to WooCommerce (ERPNext is the master)
+- **Category sync** maintaining your existing hierarchy
+- **Real-time inventory** updates as stock moves in ERPNext
+- **Order import** from WooCommerce to ERPNext for fulfillment
+- **Customer data** centralized in ERPNext
+- **Pricing management** in ERPNext with sync to WooCommerce
 
 ### Benefits for JT Custom Trailers
 
 - Single source of truth for inventory across warehouse, showroom, and online
-- Automated order processing from web orders
-- Integrated accounting (no double-entry)
-- Track custom trailer builds with work orders
-- Manage parts inventory with serial/batch tracking
-- Centralized customer relationship management
+- Automated order processing — no re-keying of web orders
+- Integrated accounting — no double-entry between e-commerce and books
+- Track custom trailer builds with work orders linked to web sales
+- Manage parts inventory with serial/batch tracking (VINs, MCOs, lot numbers)
+- Centralized CRM with all customer touchpoints in one place
 
 ---
 
 ## Prerequisites
 
-### On ERPNext Server
+### ERPNext side
 
-- ERPNext v15.x installed and configured
-- Administrator access to ERPNext
-- Site URL accessible from your WordPress server
-- API access enabled in ERPNext
+- ERPNext v15.x deployed and running
+- Administrator access
+- API key/secret generated (see Setup, Step 1)
+- Network reachability from your WordPress App Service (typically via VNet integration)
 
-### On WordPress/WooCommerce Server
+### WooCommerce side
 
-- WordPress with WooCommerce installed (your Azure App Service)
-- WP REST API enabled (default in WordPress)
-- Administrator access to WordPress
-- SSL certificate (recommended for API security)
+- WordPress with WooCommerce installed (your existing Azure App Service)
+- WooCommerce 5.0 or higher
+- PHP 7.4+ (tested up to 8.3)
+- WordPress Administrator access
+- VNet integration enabled on the App Service so it can reach the private ERPNext VM
+- SSL certificate (recommended even for VNet traffic)
 
-### Required Information
+### Your environment specifics
 
-From your setup, you have:
-- **WordPress Site:** https://www.jtcustomtrailers.com
-- **WordPress Admin:** Access to WordPress admin panel
-- **ERPNext Site:** http://[YOUR-ERPNEXT-IP] (after deployment)
-- **ERPNext Admin:** Administrator / Admin@JTCustom2026!
+- **WordPress site:** https://www.jtcustomtrailers.com
+- **WordPress App Service:** in the Azure tenant, joined to `jtcustomtr-2e886f0313-vnet`
+- **ERPNext URL (private):** `http://10.0.2.4` (or whatever private IP the deployment script returned)
+- **ERPNext admin credentials:** retrieved from Azure Key Vault (see next section)
 
----
+### Retrieving credentials from Key Vault
 
-## Integration Methods
+Don't store ERPNext admin passwords in documentation or config files. Pull from Key Vault each time:
 
-### Method 1: ERPNext WooCommerce Integration App (Recommended)
+```powershell
+$pw = Get-AzKeyVaultSecret `
+    -VaultName 'JTC-prod-westus2-kv' `
+    -Name 'JTC-prod-erpnext-westus2-vm-erpnext-admin-password' `
+    -AsPlainText
+$pw | Set-Clipboard
+# Password is now in your clipboard
+```
 
-**Pros:**
-- Official ERPNext app
-- Bidirectional sync
-- Maintained by Frappe team
-- Built-in mapping tools
-- Real-time inventory updates
-
-**Cons:**
-- Requires configuration
-- May need customization for complex workflows
-
-### Method 2: Custom API Integration
-
-**Pros:**
-- Complete control
-- Fully customizable
-- Can handle complex business logic
-
-**Cons:**
-- Requires development
-- Maintenance overhead
-- Need to handle edge cases
-
-### Method 3: Third-Party Middleware
-
-**Pros:**
-- Pre-built connectors
-- Visual workflow builders
-
-**Cons:**
-- Monthly subscription costs
-- Limited customization
-- Dependency on third party
-
-**For JT Custom Trailers: Method 1 is recommended** as it provides the best balance of functionality, maintainability, and cost.
+The vault and secret name will match what the deployment script created. The secret naming convention is `<VMName>-erpnext-admin-password`.
 
 ---
 
-## Recommended Approach
+## Architecture: Private-network integration
 
-### ERPNext WooCommerce Integration App
+```
+┌─────────────────────────────────────────────────────────────┐
+│           VNet: jtcustomtr-2e886f0313-vnet                  │
+│                                                             │
+│  ┌──────────────────────┐         ┌──────────────────────┐  │
+│  │   WordPress App      │         │   ERPNext VM         │  │
+│  │   Service            │  HTTPS  │   (private only)     │  │
+│  │   appsubnet          │────────▶│   erpnext-subnet     │  │
+│  │   10.0.0.0/25        │ API     │   10.0.2.0/27        │  │
+│  │                      │ key/sec │                      │  │
+│  └──────────┬───────────┘         └──────────┬───────────┘  │
+│             │                                │              │
+│             │ (public for shoppers)          │ (private)    │
+└─────────────┼────────────────────────────────┼──────────────┘
+              │                                │
+              ▼                                ▼
+       Internet shoppers              You (via VPN)
+       buy products on                or peered VNets
+       www.jtcustomtrailers.com
+```
 
-This is the official integration app maintained by Frappe (the company behind ERPNext).
+**Key architectural points:**
 
-#### Installation
+- WordPress App Service is publicly accessible (shoppers need to reach it). The WordPress side calls ERPNext over the VNet using its private IP.
+- ERPNext VM has **no public IP**. Only resources inside the VNet (or peered VNets / VPN-connected clients) can reach it.
+- The WordPress → ERPNext API calls travel over Azure's backbone, never the public internet.
+- VNet integration on the App Service is what makes this work — it gives the App Service a NIC in the appsubnet so it can route to other VNet resources.
 
-1. **SSH into your ERPNext server:**
-   ```bash
-   ssh jtadmin@[YOUR-ERPNEXT-IP]
-   ```
+---
 
-2. **Navigate to frappe-bench:**
-   ```bash
-   cd /home/jtadmin/frappe-bench
-   ```
+## Integration approach
 
-3. **Get the WooCommerce integration app:**
-   ```bash
-   bench get-app woocommerceconnector
-   ```
+### WooCommerce-side plugin (recommended)
 
-4. **Install on your site:**
-   ```bash
-   bench --site jtcustomtrailers.local install-app woocommerceconnector
-   ```
+ERPNext now publishes an integration plugin that runs **inside WordPress** and reaches out to ERPNext. This is the inverse of the deprecated v14 pattern.
 
-5. **Restart bench:**
-   ```bash
-   bench restart
-   ```
+**Why this is the right fit for JT Custom Trailers:**
+
+- Doesn't require installing a Frappe app inside ERPNext (which has been a maintenance pain point in the v15 ecosystem)
+- Works well with private-network ERPNext — WordPress in the same VNet can reach the private IP
+- Configuration lives in WordPress where your admins are already working
+- Maintained alongside WooCommerce, so it tracks WC versions cleanly
+
+### Alternatives if the plugin doesn't fit
+
+| Option | When to choose | Notes |
+|---|---|---|
+| **woocommerce_fusion** (Starktail/dvdl16 fork) | If you need bidirectional sync features the WooCommerce-side plugin doesn't cover | Community-maintained v15 connector; opposite direction (Frappe app calls WC) |
+| **Custom API integration** | If your workflow has unusual requirements | Full control, but you own maintenance forever |
+| **n8n / Zapier middleware** | If you also need to integrate with other systems (Mailchimp, ShipStation, etc.) | Adds another moving part but central to multi-system flows |
+
+For this guide, we proceed with **the WooCommerce-side plugin**.
 
 ---
 
 ## Setup Instructions
 
-### Step 1: Configure WooCommerce API Keys
+### Step 1: Generate ERPNext API credentials
 
-1. **Log into WordPress Admin:**
-   - Go to https://www.jtcustomtrailers.com/wp-admin
+In ERPNext:
 
-2. **Navigate to WooCommerce Settings:**
-   - WooCommerce → Settings → Advanced → REST API
+1. Click your user avatar (top right) → **My Settings**
+2. Scroll to **API Access**
+3. Click **Generate Keys**
+4. Copy and save **both** the API Key and API Secret immediately — the Secret is only displayed once
 
-3. **Create API Key:**
-   - Click "Add key"
-   - Description: "ERPNext Integration"
-   - User: (Select your admin user)
-   - Permissions: "Read/Write"
-   - Click "Generate API key"
+If you miss the Secret, you'll need to regenerate the keys (which invalidates the previous Secret).
 
-4. **Save credentials securely:**
-   ```
-   Consumer Key: ck_XXXXXXXXXXXXXXXXXXXX
-   Consumer Secret: cs_XXXXXXXXXXXXXXXXXXXX
-   ```
+**Store these in Key Vault** rather than a config file:
 
-### Step 2: Configure ERPNext WooCommerce Settings
+```powershell
+$apiKey    = Read-Host "ERPNext API Key"
+$apiSecret = Read-Host "ERPNext API Secret" -AsSecureString | ConvertFrom-SecureString -AsPlainText
+Set-AzKeyVaultSecret -VaultName 'JTC-prod-westus2-kv' `
+    -Name 'erpnext-wc-integration-api-key'    -SecretValue (ConvertTo-SecureString $apiKey -AsPlainText -Force)
+Set-AzKeyVaultSecret -VaultName 'JTC-prod-westus2-kv' `
+    -Name 'erpnext-wc-integration-api-secret' -SecretValue (ConvertTo-SecureString $apiSecret -AsPlainText -Force)
+```
 
-1. **Log into ERPNext:**
-   - Go to http://[YOUR-ERPNEXT-IP]
-   - Login as Administrator
+### Step 2: Install the ERPNext Integration plugin in WordPress
 
-2. **Navigate to WooCommerce Settings:**
-   - Search for "WooCommerce Settings" in the search bar
-   - Or go to: Integrations → WooCommerce Settings
+1. In WordPress Admin: **Plugins** → **Add New**
+2. Search for "ERPNext Integration" (or upload the plugin zip if installing from a release)
+3. Install and **Activate**
+4. A new menu item **ERPNext Integration** appears in the WordPress admin sidebar
 
-3. **Enter WooCommerce Details:**
-   ```
-   Enable Sync: ✓ (checked)
-   WooCommerce Server URL: https://www.jtcustomtrailers.com
-   API Consumer Key: [Your Consumer Key from Step 1]
-   API Consumer Secret: [Your Consumer Secret from Step 1]
-   ```
+### Step 3: Configure the API connection
 
-4. **Configure Sync Settings:**
-   ```
-   Enable Item Sync: ✓
-   Enable Order Sync: ✓
-   Enable Customer Sync: ✓
-   Warehouse: Main Warehouse (or your primary warehouse)
-   Company: JT Custom Trailers
-   ```
+1. **ERPNext Integration → API Settings**
+2. Fill in:
+   - **Host URL:** `http://10.0.2.4` (the private IP of your ERPNext VM)
+     - For SSL eventually, this becomes `https://erpnext.internal.jtcustomtrailers.com` once you set up internal DNS + a certificate
+   - **API Key:** the key from Step 1
+   - **API Secret:** the secret from Step 1
+   - **SSL Verification:** disabled initially (since you're on plain HTTP over private IP). Enable once SSL is in place.
+   - **Debug Mode:** enable temporarily during initial setup; disable once stable
+3. Click **Test Connection**
+4. Verify the dashboard shows **Connected** (green)
 
-5. **Tax Configuration:**
-   - Map WooCommerce tax classes to ERPNext tax templates
-   - Default Tax Template: (Select your sales tax template)
+### Step 4: Configure foundational settings
 
-6. **Save settings**
+**ERPNext Integration → Configurations** in WordPress:
 
-### Step 3: Initial Category Sync
+```
+Company: AWS Solutions LLC dba JT Custom Trailers
+Default Warehouse: Main Warehouse
+Default Customer Group: Individual
+Default Territory: United States
+Tax Template: (your sales tax template)
+Default UOM: Nos
+```
 
-ERPNext will need to know your category structure. The integration typically creates Item Groups in ERPNext that map to WooCommerce categories.
+The Company name here must match exactly what's set up in ERPNext.
 
-#### Manual Category Mapping
+### Step 5: Generate the WooCommerce REST API key (for ERPNext-to-WooCommerce direction)
 
-1. **In ERPNext, go to:** Stock → Item Group
-2. **For each major category in your ProductCategories.xlsx:**
-   - Create an Item Group (e.g., "Interior", "Exterior", "Electrical & Solar")
-   - Set the parent group as needed to mirror your hierarchy
-   - Enable "Is Group" for parent categories
+Even though the plugin handles most traffic, some setups also need ERPNext to push updates back to WooCommerce. Generate a WooCommerce REST API key:
 
-See [Category Mapping](#category-mapping) section below for detailed mapping table.
+1. WordPress Admin → **WooCommerce** → **Settings** → **Advanced** → **REST API**
+2. Click **Add Key**
+3. Description: `ERPNext Integration`
+4. User: pick an admin user
+5. Permissions: **Read/Write**
+6. Click **Generate API Key**
+7. Save both **Consumer Key** (`ck_...`) and **Consumer Secret** (`cs_...`) — Secret is only shown once
 
-### Step 4: Configure Item Sync
+Store these in Key Vault too:
 
-1. **In ERPNext WooCommerce Settings:**
-   - Enable "Sync Items from ERPNext to WooCommerce"
-   - Set sync frequency (recommended: Every 30 minutes)
+```powershell
+Set-AzKeyVaultSecret -VaultName 'JTC-prod-westus2-kv' `
+    -Name 'wc-api-consumer-key'    -SecretValue (ConvertTo-SecureString 'ck_...' -AsPlainText -Force)
+Set-AzKeyVaultSecret -VaultName 'JTC-prod-westus2-kv' `
+    -Name 'wc-api-consumer-secret' -SecretValue (ConvertTo-SecureString 'cs_...' -AsPlainText -Force)
+```
 
-2. **Field Mapping (default is usually fine):**
-   ```
-   ERPNext Item Code → WooCommerce SKU
-   ERPNext Item Name → WooCommerce Product Name
-   ERPNext Description → WooCommerce Product Description
-   ERPNext Standard Rate → WooCommerce Regular Price
-   ERPNext Item Group → WooCommerce Product Category
-   ```
+### Step 6: Initial category sync
 
-3. **Image Sync:**
-   - Enable "Sync Images"
-   - Images in ERPNext will sync to WooCommerce
+Categories need to exist in ERPNext as Item Groups before products can sync. Use the provided PowerShell script to bulk-create the hierarchy:
 
-### Step 5: Test Sync
+```powershell
+Install-Module -Name ImportExcel -Force -Scope CurrentUser   # if not already installed
+
+$apiKey    = Get-AzKeyVaultSecret -VaultName 'JTC-prod-westus2-kv' -Name 'erpnext-wc-integration-api-key' -AsPlainText
+$apiSecret = Get-AzKeyVaultSecret -VaultName 'JTC-prod-westus2-kv' -Name 'erpnext-wc-integration-api-secret' -AsPlainText
+
+# Dry run first to validate
+.\Import-ERPNextCategories.ps1 `
+    -ProductCategoriesPath .\ProductCategories.xlsx `
+    -ERPNextURL "http://10.0.2.4" `
+    -APIKey $apiKey -APISecret $apiSecret `
+    -DryRun
+
+# Real import
+.\Import-ERPNextCategories.ps1 `
+    -ProductCategoriesPath .\ProductCategories.xlsx `
+    -ERPNextURL "http://10.0.2.4" `
+    -APIKey $apiKey -APISecret $apiSecret
+```
+
+This must be run from a machine that can reach the ERPNext private IP — either through VPN or from inside the VNet itself.
+
+### Step 7: Test product sync
 
 1. **Create a test item in ERPNext:**
    ```
-   Item Code: TEST-001
-   Item Name: Test Trailer Part
-   Item Group: Interior → Bedding & Sleeping
-   Standard Rate: 50.00
+   Item Code:        TEST-SYNC-001
+   Item Name:        Test Product Sync
+   Item Group:       Interior
+   Standard Rate:    99.99
+   Maintain Stock:   ✓
+   Show in Website:  ✓
+   Default Warehouse: Main Warehouse
    ```
-
-2. **Run sync manually:**
-   - In WooCommerce Settings, click "Sync Now"
-
-3. **Verify in WooCommerce:**
-   - Check Products in WooCommerce admin
-   - Verify the test item appears with correct category
-
-4. **Delete test item** after verification
+2. Add an opening stock entry (Stock → Stock Entry → Material Receipt) so the item has inventory
+3. In WordPress: **ERPNext Integration → Sync → Sync Now**
+4. Verify the item appears in **WooCommerce → Products**
+5. Delete the test item from both systems once verified
 
 ---
 
 ## Data Synchronization
 
-### What Syncs and When
+### What syncs and when
 
 | Data Type | Direction | Frequency | Notes |
-|-----------|-----------|-----------|-------|
-| Products | ERPNext → WooCommerce | Every 30 min (or manual) | New items, updates, inventory |
-| Categories | ERPNext → WooCommerce | Manual/On-demand | Initial setup, then as needed |
-| Inventory | ERPNext → WooCommerce | Real-time (on stock change) | Stock levels sync automatically |
-| Orders | WooCommerce → ERPNext | Every 15 min | New orders imported |
-| Customers | WooCommerce → ERPNext | With orders | Customer created if doesn't exist |
-| Order Status | ERPNext → WooCommerce | Manual/On fulfillment | Update shipping status |
+|---|---|---|---|
+| Products | ERPNext → WooCommerce | Every 30 min (configurable) | New items + updates + inventory |
+| Categories | ERPNext → WooCommerce | Manual / on-demand | Initial setup, then as needed |
+| Inventory | ERPNext → WooCommerce | Real-time on stock change | Out-of-stock items auto-marked |
+| Orders | WooCommerce → ERPNext | Every 15 min | New orders create Sales Orders |
+| Customers | WooCommerce → ERPNext | With orders | Created if doesn't exist |
+| Order Status | ERPNext → WooCommerce | On Delivery Note submission | Tracking number can be synced |
 
-### Sync Behavior
+### Sync behavior notes
 
-**Product Sync:**
-- Only items with "Show in Website" enabled will sync to WooCommerce
-- ERPNext is the master - changes in WooCommerce may be overwritten
-- Images sync from ERPNext attachments
+**Products:** Only items with **Show in Website** enabled sync. ERPNext is master — changes made in WooCommerce will be overwritten on the next sync. Images attached in ERPNext sync to WooCommerce.
 
-**Inventory Sync:**
-- Real-time when stock entry is made in ERPNext
-- WooCommerce stock updates immediately
-- Out-of-stock items automatically marked in WooCommerce
+**Inventory:** Real-time when stock entries are made in ERPNext. The WooCommerce stock value updates within seconds.
 
-**Order Sync:**
-- WooCommerce orders create Sales Orders in ERPNext
-- Payment status synced
-- Shipping address mapped
-- Customer created/updated
+**Orders:** WooCommerce orders create Sales Orders in ERPNext. Payment status, shipping address, and customer information all sync.
 
 ---
 
 ## Category Mapping
 
-Based on your ProductCategories.xlsx, here's the recommended ERPNext Item Group structure:
+> **Note:** The category list below reflects the WooCommerce category structure as of February 2026. Your current categories may have evolved — verify against your current `ProductCategories.xlsx` before importing.
 
 ### Parent Categories (Level 0)
 
-| WooCommerce Category | ERPNext Item Group | Term ID |
-|----------------------|--------------------|---------|
-| Uncategorized | Uncategorized | 15 |
-| General | General | 17 |
-| Audio and Entertainment | Audio and Entertainment | 41 |
-| Interior | Interior | 43 |
-| Exterior | Exterior | 44 |
-| Electrical & Solar | Electrical & Solar | 45 |
-| Plumbing & Tanks | Plumbing & Tanks | 46 |
-| Climate Control | Climate Control | 47 |
-| Towing, Chassis & Running Gear | Towing, Chassis & Running Gear | 48 |
-| Hardware, Construction, & Materials | Hardware, Construction, & Materials | 49 |
-| Accessories & Lifestyle | Accessories & Lifestyle | 50 |
-| Tools & Install Supplies | Tools & Install Supplies | 51 |
-| Condition | Condition | 52 |
-| Specials | Specials | 53 |
-| Construction Equipment | Construction Equipment | 214 |
-| Trailers | Trailers | 311 |
+| WooCommerce Category | ERPNext Item Group |
+|---|---|
+| Uncategorized | Uncategorized |
+| General | General |
+| Audio and Entertainment | Audio and Entertainment |
+| Interior | Interior |
+| Exterior | Exterior |
+| Electrical & Solar | Electrical & Solar |
+| Plumbing & Tanks | Plumbing & Tanks |
+| Climate Control | Climate Control |
+| Towing, Chassis & Running Gear | Towing, Chassis & Running Gear |
+| Hardware, Construction, & Materials | Hardware, Construction, & Materials |
+| Accessories & Lifestyle | Accessories & Lifestyle |
+| Tools & Install Supplies | Tools & Install Supplies |
+| Condition | Condition |
+| Specials | Specials |
+| Construction Equipment | Construction Equipment |
+| Trailers | Trailers |
 
-### Example: Interior Category Hierarchy
+Use `Import-ERPNextCategories.ps1` to create all of these (and their subcategories) automatically from your live Excel export.
+
+### Example: Interior category hierarchy
 
 ```
-Interior (Parent)
+Interior
 ├── Bedding & Sleeping
 │   ├── Bedding Sets & Linens
 │   ├── Mattress Toppers & Pads
@@ -337,270 +352,228 @@ Interior (Parent)
 └── (etc.)
 ```
 
-### Creating Categories in ERPNext
-
-Use the provided PowerShell script `Import-ERPNextCategories.ps1` (see separate file) to automatically create the full hierarchy.
-
 ---
 
 ## Product Sync Configuration
 
-### Item Master Setup in ERPNext
+### Item master setup in ERPNext
 
-For each product you want to sync:
+For each product that should sync to the website:
 
-1. **Basic Information:**
-   ```
-   Item Code: [Your SKU]
-   Item Name: [Product Name]
-   Item Group: [Select from mapped categories]
-   Default Unit of Measure: Nos (or Kg, M, etc.)
-   ```
+```
+Item Code:           [SKU - must be unique]
+Item Name:           [Customer-facing name]
+Item Group:          [Choose from imported categories]
+Default UOM:         Nos (or Kg, M, etc.)
+Show in Website:     ✓
+Standard Rate:       [Price]
+Maintain Stock:      ✓
+Default Warehouse:   Main Warehouse
+```
 
-2. **Website Configuration:**
-   ```
-   Show in Website: ✓ (checked)
-   Weightage: [For sorting, optional]
-   ```
+Attach product images in the **Image** section. These sync to WooCommerce as product gallery images.
 
-3. **Pricing:**
-   ```
-   Standard Selling Rate: [Your price]
-   ```
+### Bulk import from existing WooCommerce
 
-4. **Inventory:**
-   ```
-   Maintain Stock: ✓ (checked)
-   Default Warehouse: Main Warehouse
-   ```
+If you're migrating an existing catalog:
 
-5. **Images:**
-   - Attach images in the "Image" section
-   - These will sync to WooCommerce
-
-### Bulk Import
-
-For your existing WooCommerce products:
-
-1. **Export from WooCommerce:**
-   - WooCommerce → Products → Export
-   - Save CSV
-
-2. **Transform to ERPNext format:**
-   - Use the provided `Transform-WooToERPNext.ps1` script
-   - This maps your columns to ERPNext Item format
-
-3. **Import to ERPNext:**
-   - ERPNext → Data Import
-   - Select "Item" document type
-   - Upload transformed CSV
-   - Map fields
-   - Import
+1. WordPress: **WooCommerce → Products → Export** (CSV)
+2. Transform to ERPNext format using `Transform-WooToERPNext.ps1` (maps WC columns to ERPNext Item fields)
+3. ERPNext: **Data Import** → select "Item" doctype → upload the transformed CSV → map fields → run
 
 ---
 
 ## Order Processing Workflow
 
-### When Order is Placed in WooCommerce
+### Standard product order
 
-1. **Order Sync runs** (every 15 minutes or manual trigger)
-
-2. **ERPNext creates:**
-   - **Customer** (if new)
-   - **Sales Order** with:
-     - Items from WooCommerce order
-     - Quantities
-     - Prices
-     - Shipping address
-     - Payment status
-
-3. **You process in ERPNext:**
+1. **Shopper places order** on www.jtcustomtrailers.com
+2. **Order sync runs** (every 15 minutes by default, or manual trigger)
+3. **ERPNext creates:**
+   - Customer record (if new)
+   - Sales Order with line items, quantities, prices, shipping address, payment status
+4. **You process in ERPNext:**
    - Review Sales Order
-   - Create Delivery Note (when shipping)
-   - Create Sales Invoice (for accounting)
-   - Create Payment Entry (if not already paid online)
+   - Create Delivery Note when shipping
+   - Create Sales Invoice for accounting
+   - Create Payment Entry if not already paid online
+5. **Status flows back to WooCommerce:**
+   - Delivery Note submission marks the WC order as Shipped
+   - Tracking number can be synced if configured
 
-4. **Status updates back to WooCommerce:**
-   - When Delivery Note is submitted, order marked as "Shipped"
-   - Tracking number can be synced
+### Custom trailer order
 
-### Custom Trailer Orders
+For custom builds requiring a Work Order:
 
-For custom builds that require work orders:
-
-1. **Order syncs from WooCommerce**
-2. **In ERPNext:**
-   - Sales Order created
+1. Order syncs from WooCommerce as above
+2. In ERPNext:
+   - Sales Order is created
    - Create Work Order for manufacturing
-   - Use Build Tracking (see Build_Tracking_Worksheet.pdf)
-   - Issue materials from stock
-   - Complete work order
-   - Create Delivery Note
-3. **Invoice and ship**
+   - Use Build Tracking workflow (see `Build_Tracking_Worksheet.pdf`)
+   - Issue materials from stock as the build progresses
+   - Complete work order when the trailer is finished
+   - Create Delivery Note when the customer takes delivery
+3. Invoice the customer and update WooCommerce with completion status
 
 ---
 
 ## Inventory Management
 
-### Multi-Warehouse Setup
+### Multi-warehouse setup
 
-You mentioned warehouse and showroom locations. Set up in ERPNext:
+```
+Main Warehouse - Ashtabula (1214 Lake Avenue)
+Showroom - Jefferson (PO Box 348)
+```
 
-1. **Create Warehouses:**
-   ```
-   Main Warehouse - Ashtabula (1214 Lake Avenue)
-   Showroom - Jefferson (PO Box 348)
-   ```
+Set Main Warehouse as default for web orders. Stock transfers move inventory between locations as needed.
 
-2. **Configure Default:**
-   - Set "Main Warehouse" as default for web orders
-   - Stock transfers between warehouses as needed
+WooCommerce shows combined stock across warehouses by default. To show only web-available stock, restrict the WC sync to a specific "Web Available" warehouse and only stock that warehouse with items you want available for online ordering.
 
-3. **Stock Sync:**
-   - WooCommerce shows combined stock across warehouses
-   - Or, configure to show only web-available stock
-
-### Serial Number / Batch Tracking
+### Serial number / batch tracking
 
 For trailers and high-value items:
 
-1. **Enable Serial No:**
-   ```
-   Item → Has Serial No: ✓
-   ```
+```
+Item → Has Serial No: ✓
+```
 
-2. **When trailer is received:**
-   - Stock Entry creates serial number
-   - VIN number can be the serial number
+When a trailer is received into stock, the Stock Entry creates a serial number record. **Use the VIN as the serial number** so traceability is built in.
 
-3. **WooCommerce:**
-   - Doesn't show serial numbers (intentionally)
-   - Customer receives serial/VIN with delivery
+WooCommerce doesn't display serial numbers (intentionally — they're issued to the customer with delivery, not advertised on the product page).
 
 ---
 
 ## Troubleshooting
 
-### Common Issues
+### Products not syncing to WooCommerce
 
-**Issue: Products not syncing to WooCommerce**
+- Verify **Show in Website** is enabled on the Item
+- Verify Item Group is assigned and exists in ERPNext
+- Check the API credentials in WordPress: ERPNext Integration → API Settings → Test Connection
+- Verify network reachability: from the WordPress App Service Kudu console, run `curl http://10.0.2.4/` — should return ERPNext HTML
+- Check ERPNext error log: **Error Log** doctype, filter for "WooCommerce" or "API"
 
-- **Check:** "Show in Website" is enabled on Item
-- **Check:** Item has Item Group assigned
-- **Check:** WooCommerce API credentials are correct
-- **Check:** ERPNext can reach your WooCommerce site (firewall/SSL)
+### Orders not importing from WooCommerce
 
-**Issue: Orders not importing from WooCommerce**
+- Verify order sync is enabled in WordPress ERPNext Integration settings
+- Verify Default Warehouse and Default Company are set
+- Check the WordPress debug.log for API errors (enable WP_DEBUG temporarily if needed)
+- Manual trigger: ERPNext Integration → Sync → Sync Orders
 
-- **Check:** Order sync is enabled in WooCommerce Settings
-- **Check:** Warehouse is set in WooCommerce Settings
-- **Check:** Company is set
-- **Check:** Error Log in ERPNext (Setup → Error Log)
+### Inventory not updating
 
-**Issue: Inventory not updating**
+- Verify stock UOM matches between ERPNext and WooCommerce
+- Confirm the warehouse you're tracking actually has stock (Stock → Stock Balance)
+- Real-time sync depends on the WC scheduler running — check WP cron health: `wp cron event list` (or use a WP-Cron plugin to verify)
 
-- **Check:** Stock UOM matches between ERPNext and WooCommerce
-- **Check:** Warehouse has stock (Stock Balance Report)
-- **Check:** Sync frequency settings
+### Images not syncing
 
-**Issue: Images not syncing**
+- Image file size should be under 2 MB for web
+- Format should be JPG or PNG
+- Verify image sync is enabled in WordPress ERPNext Integration settings
 
-- **Check:** Image file size (keep under 2MB for web)
-- **Check:** Image format (JPG/PNG recommended)
-- **Check:** "Sync Images" is enabled
+### Network connectivity issues
 
-### Logs and Debugging
+Since ERPNext is on a private IP, network problems are a common source of integration breakage:
 
-1. **ERPNext Error Log:**
-   - Setup → Error Log
-   - Filter by "WooCommerce"
+```bash
+# From WordPress App Service Kudu console (Debug Console > CMD):
+curl -v http://10.0.2.4/
 
-2. **Sync Log:**
-   - WooCommerce Settings → View Sync Log
+# Should return HTML or HTTP 200. Common failures:
+# - "Connection refused": Frappe/nginx not running on the VM
+# - "Timeout": NSG blocking traffic, or App Service not VNet-integrated
+# - "Name or service not known": you used a hostname that doesn't resolve
+```
 
-3. **Background Jobs:**
-   - Check that background jobs are running
-   - `bench doctor` on server
+If App Service can't reach the private IP:
+1. Verify the App Service has VNet integration enabled
+2. Verify the App Service's integrated subnet is in the same VNet as the ERPNext subnet (or peered)
+3. Verify the ERPNext VM's NSG allows inbound from the VirtualNetwork service tag
 
-4. **WordPress Debug:**
-   - Enable WP_DEBUG in wp-config.php temporarily
-   - Check debug.log for API errors
+### Logs and debugging
+
+| Log | Location |
+|---|---|
+| ERPNext error log | ERPNext UI → Error Log doctype |
+| WP plugin sync log | ERPNext Integration → Logs |
+| WordPress debug log | `wp-content/debug.log` (when WP_DEBUG is on) |
+| ERPNext bench logs | `/home/jtadmin/frappe-bench/logs/` on the VM |
+| Background job health | `bench doctor` on the VM |
 
 ---
 
 ## Maintenance and Monitoring
 
-### Daily Tasks
+### Daily
 
-- Monitor order sync (should be automatic)
-- Review any failed syncs in Error Log
+- Glance at sync status in WordPress (ERPNext Integration dashboard should show green)
+- Review any failed syncs in ERPNext Error Log
 
-### Weekly Tasks
+### Weekly
 
-- Review inventory accuracy
-- Check for unsynchronized items
+- Inventory accuracy spot-check (pick 5 random SKUs, compare ERPNext stock vs. physical count vs. WooCommerce display)
+- Check for unsynchronized items (items in ERPNext with Show in Website but missing from WC)
 - Verify pricing consistency
 
-### Monthly Tasks
+### Monthly
 
 - Full inventory reconciliation
-- Review sync logs for patterns
+- Review sync logs for patterns (recurring errors are easy to dismiss day-to-day but accumulate into real problems)
 - Update category mappings if product lines change
 
-### Backup Strategy
+### Backup strategy
 
 **ERPNext:**
-- Automated daily backups (configured in bench)
-- Download weekly to local storage
 
-**WooCommerce:**
-- UpdraftPlus plugin (already installed) handles WordPress backups
-- Ensure ERPNext sync means data is duplicated safely
+```bash
+# On the VM, set up daily backups
+sudo -u jtadmin bash -c 'cd /home/jtadmin/frappe-bench && bench --site jtcustomtrailers.local backup'
+
+# Or schedule via cron:
+# Daily backup at 2 AM, with files:
+0 2 * * * cd /home/jtadmin/frappe-bench && /usr/local/bin/bench --site jtcustomtrailers.local backup --with-files
+```
+
+Pair this with Azure Backup for the VM itself, or sync the backup directory to Azure Blob Storage.
+
+**WordPress:** UpdraftPlus (or whichever plugin you're using) handles the WP side. Ensure both backups are tested quarterly by performing a real restore to a throwaway environment.
 
 ---
 
-## Next Steps
+## Next steps
 
-1. **Deploy ERPNext** using the provided `Deploy-ERPNextToAzure.ps1` script
-2. **Run installation** on the Azure VM
-3. **Install WooCommerce Connector** app in ERPNext
-4. **Configure API keys** in WooCommerce
-5. **Set up categories** using the category import script
-6. **Test sync** with a few sample products
-7. **Bulk import** your existing product catalog
-8. **Enable order sync** and monitor
+1. Deploy ERPNext using `Deploy-ERPNextToAzure.ps1` v1.6.4+ in private-only mode
+2. Run the post-install setup wizard in ERPNext
+3. Generate API credentials and store in Key Vault
+4. Install and configure the WordPress ERPNext Integration plugin
+5. Run `Import-ERPNextCategories.ps1` to seed Item Groups
+6. Test with one or two sample products
+7. Bulk import existing catalog
+8. Enable order sync and monitor for a week before going fully live
 
 ---
 
 ## Additional Resources
 
-### ERPNext Documentation
-- https://docs.erpnext.com/
-- https://frappeframework.com/docs
-
-### WooCommerce REST API
-- https://woocommerce.github.io/woocommerce-rest-api-docs/
-
-### WooCommerce Connector
-- https://github.com/frappe/woocommerceconnector
+- ERPNext documentation: https://docs.erpnext.com/
+- Frappe framework: https://frappeframework.com/docs
+- WooCommerce REST API: https://woocommerce.github.io/woocommerce-rest-api-docs/
+- WooCommerce side ERPNext plugin: https://woocommerce.com/document/erpnext-integration/
+- ERPNext community forum: https://discuss.erpnext.com/
+- Frappe community forum: https://discuss.frappe.io/
 
 ---
 
-## Support Contacts
+## Support contacts
 
-**ERPNext Community Forum:**
-- https://discuss.erpnext.com/
+**Implementation lead:** John O'Neill Sr. — JONeillSr@jtcustomtrailers.com — (440) 813-6695
 
-**Frappe Support:**
-- https://frappe.io/support
-
-**Your Implementation:**
-- John O'Neill Sr.
-- JONeillSr@jtcustomtrailers.com
-- (440) 813-6695
+**GitHub:** https://github.com/JONeillSr/
 
 ---
 
-**Document Version:** 1.0.0  
-**Last Updated:** 02/17/2026  
-**Next Review:** 03/17/2026
+**Document Version:** 2.0.0
+**Last Updated:** 05/16/2026
+**Next Review:** 08/16/2026

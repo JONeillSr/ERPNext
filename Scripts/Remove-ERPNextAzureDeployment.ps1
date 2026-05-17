@@ -152,7 +152,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      05/15/2026
-    Version:          1.2.2
+    Version:          1.3.1
     GitHub:           https://github.com/JONeillSr/
 
     PREREQUISITES:
@@ -291,7 +291,16 @@ param(
 
     [Parameter()]
     [ValidateRange(5, 240)]
-    [int]$TimeoutMinutes = 30
+    [int]$TimeoutMinutes = 30,
+
+    [Parameter(HelpMessage='Name of an external VNet (in this subscription) from which to remove a subnet. Use when the ERPNext VM was deployed with -ExistingVNetName so its subnet lives outside the ERPNext RG.')]
+    [string]$ExternalVNetName,
+
+    [Parameter(HelpMessage='Resource group containing the external VNet.')]
+    [string]$ExternalVNetResourceGroup,
+
+    [Parameter(HelpMessage='Name of the subnet to remove from the external VNet. Default: erpnext-subnet.')]
+    [string]$ExternalSubnetName = 'erpnext-subnet'
 )
 
 #Requires -Version 7.2
@@ -300,7 +309,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$ScriptVersion = "1.2.2"
+$ScriptVersion = "1.3.1"
 $LogFile = Join-Path $PSScriptRoot "Remove-ERPNextAzureDeployment_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 Write-Host "===============================================================" -ForegroundColor Yellow
@@ -798,6 +807,9 @@ try {
     if ($KeyVaultName) {
         Write-Host "  Key Vault:          $KeyVaultName  (purge: $($PurgeKeyVault.IsPresent))"
     }
+    if ($ExternalVNetName) {
+        Write-Host "  External Subnet:    $ExternalSubnetName in $ExternalVNetName"
+    }
     Write-Host "  Remove locks:       $($RemoveLocks.IsPresent)"
     Write-Host "  Local artifacts:    $($RemoveLocalArtifacts.IsPresent)"
     Write-Host "  WhatIf:             $($WhatIfPreference)"
@@ -894,20 +906,61 @@ try {
 
             Write-LogMessage "Deleting Resource Group '$ResourceGroupName' (this may take several minutes)..." -Level Info
             if ($PSCmdlet.ShouldProcess("Resource Group: $ResourceGroupName", 'Delete')) {
-                $rgJob = Remove-AzResourceGroup -Name $ResourceGroupName -Force -Confirm:$false -AsJob
+                # Background-job runspaces don't inherit $ConfirmPreference or
+                # $PSDefaultParameterValues from the parent session. If we just
+                # called "Remove-AzResourceGroup -Force -Confirm:$false -AsJob",
+                # the job would launch a fresh runspace where ConfirmPreference
+                # is 'High' by default, the cmdlet would prompt for confirmation,
+                # the prompt would have no console to talk to, and the job would
+                # sit in 'Blocked' state forever.
+                #
+                # The fix: launch the deletion via Start-Job with an explicit
+                # script block that sets ConfirmPreference INSIDE the runspace
+                # before invoking the cmdlet. We also re-import Az.Resources
+                # because the new runspace doesn't have our modules loaded.
+                $rgJob = Start-Job -ScriptBlock {
+                    param($RGName, $SubId, $TenantId)
+                    $ConfirmPreference = 'None'
+                    $PSDefaultParameterValues['*:Confirm'] = $false
+                    Import-Module Az.Resources -ErrorAction Stop
+                    Import-Module Az.Accounts -ErrorAction Stop
+                    # The job runspace also has its own (empty) Az context.
+                    # Set it before calling cmdlets that need authentication.
+                    try {
+                        $null = Set-AzContext -Tenant $TenantId -SubscriptionId $SubId -ErrorAction SilentlyContinue
+                    } catch { }
+                    Remove-AzResourceGroup -Name $RGName -Force -Confirm:$false
+                } -ArgumentList $ResourceGroupName, $context.Subscription.Id, $context.Tenant.Id
+
                 $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
 
                 # Wait while the job is in any non-terminal state. The job starts in
                 # 'NotStarted' and transitions through 'Running' to a terminal state
-                # ('Completed', 'Failed', 'Stopped'). Previously we only looped while
-                # State -eq 'Running' which exited immediately if the job was still
-                # 'NotStarted', causing the script to silently skip the actual deletion.
+                # ('Completed', 'Failed', 'Stopped'). 'Blocked' would indicate the
+                # job is waiting for an unanswerable prompt - the fix above prevents
+                # that, but we still don't want an infinite loop, so 'Blocked' for
+                # more than 2 minutes triggers an explicit failure.
                 $terminalStates = @('Completed', 'Failed', 'Stopped')
+                $firstBlockedAt = $null
                 while ($rgJob.State -notin $terminalStates) {
                     if ((Get-Date) -gt $deadline) {
                         Write-LogMessage "RG deletion exceeded $TimeoutMinutes minute timeout." -Level Error
                         Stop-Job $rgJob
                         throw "Timeout deleting Resource Group."
+                    }
+                    if ($rgJob.State -eq 'Blocked') {
+                        if (-not $firstBlockedAt) { $firstBlockedAt = Get-Date }
+                        elseif (((Get-Date) - $firstBlockedAt).TotalMinutes -gt 2) {
+                            Write-LogMessage "Job has been 'Blocked' for over 2 minutes - aborting." -Level Error
+                            Write-LogMessage "This typically indicates an unanswerable confirmation prompt inside the job runspace." -Level Error
+                            Write-LogMessage "Workaround: run synchronously instead:" -Level Warning
+                            Write-LogMessage "  Remove-AzResourceGroup -Name '$ResourceGroupName' -Force -Confirm:`$false" -Level Warning
+                            Stop-Job $rgJob
+                            Remove-Job $rgJob -Force
+                            throw "Background-job runspace blocked on prompt."
+                        }
+                    } else {
+                        $firstBlockedAt = $null
                     }
                     Write-LogMessage "  RG deletion in progress... ($([int]((Get-Date) - $rgJob.PSBeginTime).TotalMinutes) min, state: $($rgJob.State))" -Level Debug
                     Start-Sleep -Seconds 30
@@ -984,6 +1037,41 @@ try {
                     Write-LogMessage "Failed to purge orphaned vault: $($_.Exception.Message)" -Level Error
                 }
             }
+        }
+    }
+
+    # External-VNet subnet cleanup. When ERPNext was deployed into an existing
+    # (shared) VNet via Deploy's -ExistingVNetName, the subnet lives in that
+    # VNet's resource group - NOT the ERPNext RG. Resource Group deletion of
+    # the ERPNext RG leaves the subnet behind. This block removes it.
+    if ($ExternalVNetName) {
+        Write-LogMessage "External VNet subnet cleanup: $ExternalSubnetName in $ExternalVNetName" -Level Info
+        $extVnetRG = if ($ExternalVNetResourceGroup) { $ExternalVNetResourceGroup } else { $ResourceGroupName }
+
+        try {
+            $extVnet = Get-AzVirtualNetwork -Name $ExternalVNetName -ResourceGroupName $extVnetRG -ErrorAction SilentlyContinue
+            if (-not $extVnet) {
+                Write-LogMessage "  External VNet '$ExternalVNetName' not found in RG '$extVnetRG'. Skipping." -Level Warning
+            } else {
+                $targetSubnet = $extVnet.Subnets | Where-Object { $_.Name -eq $ExternalSubnetName }
+                if (-not $targetSubnet) {
+                    Write-LogMessage "  Subnet '$ExternalSubnetName' not found in VNet. Skipping." -Level Info
+                } elseif ($targetSubnet.IpConfigurations.Count -gt 0) {
+                    Write-LogMessage "  Subnet '$ExternalSubnetName' still has $($targetSubnet.IpConfigurations.Count) IP configuration(s) attached. Refusing to delete." -Level Warning
+                    Write-LogMessage "  This usually means the RG deletion above didn't actually remove the NIC. Investigate before retrying." -Level Warning
+                    $allResults += @{ Status = 'Failed'; Type = 'Subnet'; Name = $ExternalSubnetName; Error = 'Subnet still has IP configs attached' }
+                } else {
+                    if ($PSCmdlet.ShouldProcess("Subnet: $ExternalSubnetName in $ExternalVNetName", 'Delete')) {
+                        Remove-AzVirtualNetworkSubnetConfig -Name $ExternalSubnetName -VirtualNetwork $extVnet | Out-Null
+                        $extVnet | Set-AzVirtualNetwork | Out-Null
+                        Write-LogMessage "  Removed subnet '$ExternalSubnetName' from VNet '$ExternalVNetName'." -Level Success
+                        $allResults += @{ Status = 'Deleted'; Type = 'Subnet'; Name = "$ExternalVNetName/$ExternalSubnetName" }
+                    }
+                }
+            }
+        } catch {
+            Write-LogMessage "  Failed to remove external subnet: $($_.Exception.Message)" -Level Error
+            $allResults += @{ Status = 'Failed'; Type = 'Subnet'; Name = $ExternalSubnetName; Error = $_.Exception.Message }
         }
     }
 

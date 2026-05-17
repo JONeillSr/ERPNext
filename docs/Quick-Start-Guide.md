@@ -3,8 +3,9 @@
 
 **Author:** John O'Neill Sr.
 **Company:** Azure Innovators
-**Updated:** 05/16/2026
-**Script Version:** 1.5.0
+**Original Create Date:** 02/17/2026
+**Last Updated:** 05/16/2026
+**Script Version:** 1.6.4 (deploy) / 1.3.1 (teardown)
 
 ---
 
@@ -14,92 +15,132 @@ A complete ERPNext deployment and WooCommerce integration package:
 
 ### Files in this package
 
-1. **Deploy-ERPNextToAzure.ps1** — End-to-end Azure VM deployment + ERPNext install
-2. **Import-ERPNextCategories.ps1** — Category import from WooCommerce Excel export
-3. **WooCommerce-Integration-Guide.md** — Full integration documentation
-4. **Data-Structure-Plan.md** — Detailed data migration plan
-5. **Quick-Start-Guide.md** — This file
-6. **README.md** — GitHub project overview
-7. **CHANGELOG.md** — Version history
+1. **Deploy-ERPNextToAzure.ps1** v1.6.4 — End-to-end Azure VM deployment + ERPNext install
+2. **Remove-ERPNextAzureDeployment.ps1** v1.3.1 — Teardown with KV purge and external subnet cleanup
+3. **Select-AzureContext.ps1** v1.1.0 — Interactive tenant/subscription selector
+4. **Import-ERPNextCategories.ps1** v1.1.0 — Category import from WooCommerce Excel export
+5. **WooCommerce-Integration-Guide.md** v2.0.0 — Full integration documentation
+6. **Data-Structure-Plan.md** v1.0.1 — Detailed data migration plan
+7. **Quick-Start-Guide.md** v1.6.4 — This file
+8. **README.md** — GitHub project overview
+9. **CHANGELOG.md** — Version history
 
 ---
 
-## What's New in 1.5.0
+## What's New Since 1.5.0
 
-End-to-end deployment is now genuinely reliable. Headline changes since 1.1.0:
+### Private-network deployment is now first-class
 
-- **Multi-tenant safety.** New `-TenantId`, `-SubscriptionId`, `-SelectContext`, and `-ConfirmContext` parameters protect you from deploying into the wrong client's tenant when you're authenticated against several. The script will refuse to proceed without explicit confirmation when ambiguity exists.
-- **Key Vault auto-RBAC.** When you pass `-UseKeyVault`, the script creates the vault, grants you the Key Vault Secrets Officer role automatically, polls for RBAC propagation, and self-heals from stale Az token cache issues. You no longer need to pre-provision permissions on the vault.
-- **Real install success detection.** The bash install on the VM emits a sentinel line only after every step completes. The deploy script scans for that sentinel before declaring success, so silent failures mid-install no longer get reported as "deployed successfully."
-- **Diagnostic dumps on failure.** When the install does fail, you get the last 50 lines of stdout, all stderr, and the exact command to retrieve the full log from the VM, all surfaced in the deploy output.
-- **Frappe v15 install fixes.** Dynamic Redis discovery (port assignments and config files vary between Frappe versions), proper Redis startup before `bench new-site`, and supervisor handoff after site creation.
+**v1.6.x added** the ability to deploy ERPNext as a private-only VM with no public IP, designed for production access via VPN or VNet peering. The deploy script can now:
+- Skip public IP creation (`-PrivateOnly`)
+- Join an existing VNet rather than creating a fresh one (`-ExistingVNetName`)
+- Create a subnet in that existing VNet at a CIDR you specify
+- Tighten NSG rules to allow inbound only from the `VirtualNetwork` service tag
 
-See [CHANGELOG.md](CHANGELOG.md) for the full history including the patch-level debugging story that produced these capabilities.
+The matching teardown handles the corresponding subnet cleanup when ERPNext is removed.
 
----
+### Ubuntu 24.04 install fixes
 
-## Earlier Highlights (from 1.1.0)
+Multiple Frappe v15 / Ubuntu 24.04 compatibility issues were resolved across the 1.5.x series — PEP 668 enforcement requiring apt-installed Ansible, the supervisor handoff requiring two passes of `bench setup production`, and home directory permissions blocking nginx traversal. End-to-end deployment now completes reliably in 8-10 minutes on a fresh Ubuntu 24.04 image.
 
-- Deployment is **end-to-end** — no manual SCP/SSH; install runs automatically via `Invoke-AzVMRunCommand`. Use `-SkipInstall` to defer
-- All passwords dynamically generated (no hardcoded defaults)
-- Optional Azure Key Vault storage for secrets (`-UseKeyVault`)
-- Optional SSH key authentication (`-UseSSHKey`)
-- Optional source-IP restriction on NSG rules (`-AllowedSourceCIDR`)
-- Idempotent — safe to re-run if a deployment fails partway through
-- Node.js 20 LTS, Ubuntu 24.04 alignment throughout
+### Auto-renaming defaults
+
+When you specify `-Location 'westus2'` (or any region other than eastus), the default RG and VM names automatically substitute the new region: `JTC-prod-erpnext-eastus-rg` becomes `JTC-prod-erpnext-westus2-rg`. Resources stay consistently named with where they actually live.
+
+### Teardown reliability
+
+The 1.2.x → 1.3.x series fixed two real bugs in the teardown script:
+- Polling for the wrong job state (`Running` instead of waiting for terminal state) caused the script to silently exit in 0 seconds while reporting success
+- Confirmation prompts inside the background-job runspace could leave the script `Blocked` forever; the runspace now has explicit `ConfirmPreference` suppression
+- New orphaned-soft-deleted-vault warning surfaces when teardown leaves a Key Vault that wasn't purged
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ---
 
 ## Quick Start Steps
 
-### Step 1: Deploy ERPNext to Azure (45-75 minutes total)
+### Step 1: Deploy ERPNext to Azure (10-15 minutes)
+
+**Prerequisites:**
 
 ```powershell
-# From PowerShell 7.2+ with Az modules installed
+# PowerShell 7.2+ with Az modules installed
 Connect-AzAccount
 
-# Basic run (defaults: D2s_v6, eastus, password auth, local JSON secrets)
-.\Deploy-ERPNextToAzure.ps1
+# If you have access to multiple tenants, select explicitly:
+.\Select-AzureContext.ps1   # interactive picker
 ```
 
-**Production-grade run** (recommended):
+**Production deployment (recommended pattern):**
 
 ```powershell
-.\Deploy-ERPNextToAzure.ps1 `
-    -ResourceGroupName "JTC-prod-erpnext-eastus-rg" `
-    -VMName "JTC-prod-erpnext-eastus-vm" `
-    -Location "eastus" `
-    -AdminUsername "jtadmin" `
-    -AllowedSourceCIDR "203.0.113.42/32" `
-    -UseSSHKey -SSHPublicKeyPath "$HOME\.ssh\id_rsa.pub" `
-    -UseKeyVault -KeyVaultName "JTC-prod-kv-eastus"
+.\Deploy-ERPNextToAzure.ps1 -ConfirmContext `
+    -UseKeyVault -KeyVaultName 'JTC-prod-westus2-kv' `
+    -Location 'westus2' `
+    -PrivateOnly `
+    -ExistingVNetName 'jtcustomtr-2e886f0313-vnet' `
+    -ExistingVNetResourceGroup 'JTC-Prod-WP-WestUS2-rg'
 ```
 
 **What this does (automatically):**
 
-1. Pre-flight checks (Az context, providers, region/size validation)
-2. Creates the Resource Group (if missing) with project tags
-3. Creates NSG, Public IP, VNet, Subnet, NIC (idempotent — skips if present)
-4. Generates secure random passwords (24-28 chars, mixed classes)
-5. Provisions Ubuntu 24.04 LTS VM with Premium SSD
-6. Stores secrets in Key Vault (or local JSON if not using Key Vault)
-7. Generates the install script
-8. Executes the install on the VM via Run Command (20-40 minutes)
-9. Returns a structured result object and writes `erpnext-connection-info.json`
+1. Pre-flight context check — you must confirm the target tenant/subscription
+2. Verifies VM size availability in your chosen region
+3. Creates `JTC-prod-erpnext-westus2-rg`
+4. Creates Key Vault `JTC-prod-westus2-kv`, grants you Secrets Officer role, waits for RBAC propagation
+5. Generates secure random passwords (24-28 chars) and stores in Key Vault
+6. Creates NSG with VirtualNetwork-only rules — NO public ingress
+7. Joins existing VNet, creates `erpnext-subnet` at `10.0.2.0/27`
+8. Creates NIC with private IP only — no public IP
+9. Provisions Ubuntu 24.04 VM (Standard_D2s_v6, Premium SSD)
+10. Generates the install script and executes via Run Command (8-10 minutes)
+11. Verifies port 8000 is listening before declaring success
+12. Returns a structured result with private IP, KV references, and connection info
 
-**Output:** A connection-info file (or Key Vault secrets) containing public IP, admin user, ERPNext URL, and credentials.
+**Alternative: public IP deployment** (faster iteration, less secure):
+
+```powershell
+.\Deploy-ERPNextToAzure.ps1 -ConfirmContext `
+    -UseKeyVault -KeyVaultName 'JTC-prod-eastus-kv' `
+    -AllowedSourceCIDR '203.0.113.42/32'
+```
+
+Use this for dev/test only — never for production with customer data.
 
 ### Step 2: Access ERPNext
 
-After the script finishes:
+Output from the deploy script:
 
 ```
-URL: http://[YOUR-VM-IP]
-Username: Administrator
-Password: (from erpnext-connection-info.json or Key Vault)
+Private IP: 10.0.2.4 (no public IP - VPN/VNet access only)
+Access ERPNext:
+  URL:  http://10.0.2.4
+        (reachable from VPN-connected clients or VNet-attached services)
+  User: Administrator
 ```
 
-**IMPORTANT:** Change the Administrator password immediately on first login.
+**To reach it from your laptop**, you need one of:
+
+| Option | How |
+|---|---|
+| **From your WordPress App Service** | Open Kudu console: `https://<wp-app>.scm.azurewebsites.net` → Debug Console → CMD → `curl http://10.0.2.4/` |
+| **Azure VPN Gateway** | Set up P2S VPN to the VNet (one-time, separate work) — once connected, browse `http://10.0.2.4` directly |
+| **Temporarily add public IP** | Portal → VM → Networking → Add public IP for one-time testing, then detach |
+| **Azure Bastion** | If you have one in the VNet, use Bastion's tunnel feature |
+
+**Pull the Administrator password from Key Vault:**
+
+```powershell
+$pw = Get-AzKeyVaultSecret `
+    -VaultName 'JTC-prod-westus2-kv' `
+    -Name 'JTC-prod-erpnext-westus2-vm-erpnext-admin-password' `
+    -AsPlainText
+$pw | Set-Clipboard
+# Password is now in your clipboard, ready to paste into ERPNext login
+```
+
+**IMPORTANT:** Change the Administrator password immediately on first login (in ERPNext: My Settings → Change Password).
 
 ### Step 3: Initial ERPNext Configuration (15 minutes)
 
@@ -111,87 +152,65 @@ Password: (from erpnext-connection-info.json or Key Vault)
    - Chart of Accounts: Standard USA
 
 2. **Create API Keys:**
-   - Click your user icon → My Settings → API Access → Generate Keys
-   - Save the Key and Secret immediately — the Secret is only displayed once
+   - User avatar → My Settings → API Access → Generate Keys
+   - Save the Key and Secret **immediately** — Secret is only displayed once
+   - Store in Key Vault rather than a config file:
+     ```powershell
+     Set-AzKeyVaultSecret -VaultName 'JTC-prod-westus2-kv' `
+         -Name 'erpnext-wc-integration-api-key' `
+         -SecretValue (ConvertTo-SecureString 'YOUR_KEY' -AsPlainText -Force)
+     # (and same for the secret)
+     ```
 
 3. **Basic Settings:**
    - System Settings → Time Zone: America/New_York
    - Date Format: MM/DD/YYYY
    - Enable email notifications
 
-### Step 4: WooCommerce API Setup (10 minutes)
+### Step 4: WooCommerce Integration Setup
 
-1. **In WordPress Admin:**
-   - WooCommerce → Settings → Advanced → REST API → Add Key
-   - Description: ERPNext Integration
-   - User: an admin user
-   - Permissions: Read/Write
-   - Save Consumer Key and Consumer Secret
+> **Heads up:** The integration approach changed in late 2025 — the old `bench get-app woocommerceconnector` pattern is no longer recommended. ERPNext's built-in WooCommerce integration was deprecated in v15.
+>
+> **New approach:** Install the ERPNext Integration plugin in WordPress (it calls ERPNext, rather than the other way around). See `WooCommerce-Integration-Guide.md` v2.0.0 for the full procedure.
 
-2. **Test the connection from PowerShell:**
-   ```powershell
-   $apiUrl = "https://www.jtcustomtrailers.com/wp-json/wc/v3/products"
-   $cred = "ck_YOUR_KEY:cs_YOUR_SECRET"
-   $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($cred))
-   Invoke-RestMethod -Uri $apiUrl -Headers @{ Authorization = "Basic $encoded" }
-   ```
+Quick version:
 
-### Step 5: Install WooCommerce Connector (5 minutes)
+1. WordPress Admin → **Plugins → Add New** → search "ERPNext Integration" → Install + Activate
+2. **ERPNext Integration → API Settings**:
+   - Host URL: `http://10.0.2.4` (your private ERPNext IP)
+   - API Key + Secret from Step 3
+3. Test Connection → should show **Connected** (green)
+4. **ERPNext Integration → Configurations**:
+   - Company: AWS Solutions LLC dba JT Custom Trailers
+   - Default Warehouse: Main Warehouse
+   - Default Customer Group: Individual
 
-SSH into the VM:
-
-```powershell
-$info = Get-Content .\erpnext-connection-info.json | ConvertFrom-Json
-ssh "$($info.AdminUsername)@$($info.PublicIP)"
-```
-
-On the VM:
-
-```bash
-cd /home/jtadmin/frappe-bench
-bench get-app woocommerceconnector
-bench --site jtcustomtrailers.local install-app woocommerceconnector
-bench restart
-```
-
-### Step 6: Configure WooCommerce Integration (10 minutes)
-
-In ERPNext, search "WooCommerce Settings" and configure:
-
-```
-Enable Sync: ✓
-WooCommerce Server URL: https://www.jtcustomtrailers.com
-API Consumer Key: [from WordPress]
-API Consumer Secret: [from WordPress]
-Enable Item Sync: ✓
-Enable Order Sync: ✓
-Warehouse: Main Warehouse
-Company: JT Custom Trailers
-```
-
-### Step 7: Import Categories (15 minutes)
+### Step 5: Import Categories (15 minutes)
 
 ```powershell
-Install-Module -Name ImportExcel -Force  # If not already installed
+Install-Module -Name ImportExcel -Force -Scope CurrentUser  # if not already installed
 
-$apiKey = "YOUR_ERPNEXT_API_KEY"
-$apiSecret = "YOUR_ERPNEXT_API_SECRET"
+# Pull API credentials from Key Vault
+$apiKey    = Get-AzKeyVaultSecret -VaultName 'JTC-prod-westus2-kv' -Name 'erpnext-wc-integration-api-key' -AsPlainText
+$apiSecret = Get-AzKeyVaultSecret -VaultName 'JTC-prod-westus2-kv' -Name 'erpnext-wc-integration-api-secret' -AsPlainText
 
 # Dry run first
 .\Import-ERPNextCategories.ps1 `
     -ProductCategoriesPath .\ProductCategories.xlsx `
-    -ERPNextURL "http://YOUR-VM-IP" `
+    -ERPNextURL "http://10.0.2.4" `
     -APIKey $apiKey -APISecret $apiSecret `
     -DryRun
 
 # Real import
 .\Import-ERPNextCategories.ps1 `
     -ProductCategoriesPath .\ProductCategories.xlsx `
-    -ERPNextURL "http://YOUR-VM-IP" `
+    -ERPNextURL "http://10.0.2.4" `
     -APIKey $apiKey -APISecret $apiSecret
 ```
 
-### Step 8: Create Warehouses (5 minutes)
+**Note:** The import must run from a machine that can reach `10.0.2.4` — either VPN-connected, or from inside the VNet.
+
+### Step 6: Create Warehouses (5 minutes)
 
 In ERPNext → Stock → Warehouse → New:
 
@@ -207,134 +226,188 @@ Type:             Retail
 Address:          PO Box 348, Jefferson, OH 44047
 ```
 
-### Step 9: Test Product Sync (10 minutes)
+### Step 7: Test Product Sync (10 minutes)
 
-1. **Create a test item in ERPNext:**
+1. Create a test item in ERPNext:
    ```
    Item Code:       TEST-SYNC-001
    Item Name:       Test Product Sync
    Item Group:      Interior
    Standard Rate:   99.99
+   Maintain Stock:  ✓
    Show in Website: ✓
-   Opening Stock:   10 (Main Warehouse)
    ```
 
-2. Trigger sync: WooCommerce Settings → Sync Now
-3. Verify the product appears in WooCommerce
-4. Delete the test item from both systems
+2. Add opening stock (Stock → Stock Entry → Material Receipt) so the item has inventory
+
+3. In WordPress: ERPNext Integration → Sync → Sync Now
+
+4. Verify the product appears in WooCommerce → Products
+
+5. Delete the test item from both systems
+
+---
+
+## Tearing Down
+
+### Use the wrapper script, not raw cmdlets
+
+```powershell
+# Full teardown of the v1.6.x private-network deployment
+.\Remove-ERPNextAzureDeployment.ps1 -Force -RemoveLocalArtifacts `
+    -ResourceGroupName 'JTC-prod-erpnext-westus2-rg' `
+    -KeyVaultName 'JTC-prod-westus2-kv' -PurgeKeyVault `
+    -ExternalVNetName 'jtcustomtr-2e886f0313-vnet' `
+    -ExternalVNetResourceGroup 'JTC-Prod-WP-WestUS2-rg'
+```
+
+This:
+1. Deletes the ERPNext RG with proper progress polling (3-5 minutes)
+2. Purges the soft-deleted Key Vault (otherwise the name is reserved 90 days)
+3. Removes `erpnext-subnet` from the shared WordPress VNet
+4. Cleans up local artifacts (install-erpnext.sh, old logs)
+5. Shows a summary
+
+### Without `-PurgeKeyVault`
+
+If you forget `-PurgeKeyVault`, the vault is soft-deleted and reserved for 90 days. The teardown script will **warn you** at the end with the exact command to purge it:
+
+```
+---------------------------------------------------------------
+NOTE: Soft-deleted Key Vault(s) remain
+---------------------------------------------------------------
+  JTC-prod-westus2-kv
+
+  These vault names are reserved for 90 days by Azure's soft-delete.
+  Re-deploying with the same name will fail until they are purged.
+
+  To purge, re-run this script with:
+    .\Remove-ERPNextAzureDeployment.ps1 -Force `
+        -KeyVaultName 'JTC-prod-westus2-kv' -PurgeKeyVault
+---------------------------------------------------------------
+```
 
 ---
 
 ## Troubleshooting
 
-### Can't connect to the VM
+### Deploy script fails before VM is created
+
+The diagnostic dump in v1.5.1+ surfaces install errors directly. For network/resource-level failures, the error message is usually clear in the script output. Most common:
+
+- **Wrong tenant/subscription** — re-run `Select-AzureContext.ps1` and pass `-ConfirmContext`
+- **Key Vault name collision** — someone else (anywhere in Azure globally) took the name. Try a more specific name with your company/region.
+- **Region/SKU not available** — try `-VMSize 'Standard_D2s_v5'` if D2s_v6 isn't in your region
+
+### Deploy script fails during install (sentinel not found)
+
+Look at the diagnostic dump in the script output. v1.5.1+ surfaces the actual bash error inline. If the dump is empty for some reason, pull the install log directly from the VM:
 
 ```powershell
-Get-AzVM -ResourceGroupName "JTC-prod-erpnext-eastus-rg" -Name "JTC-prod-erpnext-eastus-vm"
-Test-NetConnection -ComputerName YOUR-VM-IP -Port 22
-Test-NetConnection -ComputerName YOUR-VM-IP -Port 80
-```
-
-Check:
-- NSG allows 22, 80, 443, 8000 from your source IP
-- VM is in `running` state
-- If you used `-AllowedSourceCIDR`, your current IP is within that range
-
-### ERPNext installation fails (Run Command path)
-
-```powershell
-# Retrieve the install log from the VM
-Invoke-AzVMRunCommand -ResourceGroupName "JTC-prod-erpnext-eastus-rg" `
-    -VMName "JTC-prod-erpnext-eastus-vm" `
+Invoke-AzVMRunCommand -ResourceGroupName 'JTC-prod-erpnext-westus2-rg' `
+    -VMName 'JTC-prod-erpnext-westus2-vm' `
     -CommandId RunShellScript `
-    -ScriptString "tail -200 /var/log/erpnext-install.log"
+    -ScriptString 'tail -200 /var/log/erpnext-install.log'
 ```
 
-Common fixes (on VM):
+This works without network access — Run Command goes through Azure's control plane.
 
-```bash
-sudo systemctl restart mariadb
-sudo systemctl restart redis-server
-sudo supervisorctl restart all
+### Can't reach the VM after successful deploy
 
-# Nuclear option — reinstall bench
-cd /home/jtadmin
-rm -rf frappe-bench
-bench init frappe-bench --frappe-branch version-15
-```
+Since there's no public IP in `-PrivateOnly` mode:
 
-### WooCommerce API connection issues
+1. **Verify the VM is healthy** via Run Command:
+   ```powershell
+   Invoke-AzVMRunCommand -ResourceGroupName 'JTC-prod-erpnext-westus2-rg' `
+       -VMName 'JTC-prod-erpnext-westus2-vm' `
+       -CommandId RunShellScript `
+       -ScriptString 'curl -sI http://localhost/'
+   ```
+   Should return HTTP/200 or similar.
 
-```bash
-curl -u "ck_KEY:cs_SECRET" https://www.jtcustomtrailers.com/wp-json/wc/v3/products
-```
+2. **From your WordPress App Service Kudu** (Debug Console → CMD):
+   ```
+   curl -v http://10.0.2.4/
+   ```
 
-Check:
-- WordPress SSL certificate is valid
-- API keys correct, with Read/Write permission
-- VM outbound to HTTPS allowed (default Azure: yes)
+3. **From your laptop**: need VPN connection to the VNet, or temporarily add a public IP via the portal for testing.
 
-### Category import errors
+### Teardown reports "0 deleted" or hangs in Blocked state
+
+You're running an older teardown script. Make sure you have **v1.3.1 or later** of `Remove-ERPNextAzureDeployment.ps1`. v1.2.0 had the polling bug (silent 0-second false success), v1.2.2 had the Blocked-state hang. Both are fixed in 1.3.1.
+
+If you're truly stuck and need to nuke an RG right now, the emergency synchronous cleanup is:
 
 ```powershell
-Test-Path .\ProductCategories.xlsx
-Get-Module -Name ImportExcel -ListAvailable
-
-Invoke-RestMethod -Uri "http://YOUR-VM-IP/api/method/frappe.auth.get_logged_user" `
-    -Headers @{ Authorization = "token $apiKey`:$apiSecret" }
+Remove-AzResourceGroup -Name 'JTC-prod-erpnext-westus2-rg' -Force -Confirm:$false
+Remove-AzKeyVault -VaultName 'JTC-prod-westus2-kv' -Location 'westus2' -InRemovedState -Force
 ```
+
+### WooCommerce integration not syncing
+
+See **WooCommerce-Integration-Guide.md** § Troubleshooting. Common: API credentials incorrect, App Service can't reach the private IP (VNet integration not enabled), or background WP cron not running.
 
 ---
 
 ## Post-Installation Checklist
 
-- [ ] ERPNext accessible at VM IP
-- [ ] Administrator password changed
+- [ ] ERPNext accessible at private IP (from VPN/VNet)
+- [ ] Administrator password changed from the generated one
 - [ ] Company information configured
-- [ ] API keys generated and stored securely
-- [ ] WooCommerce API connected
-- [ ] WooCommerce Connector installed
+- [ ] API keys generated and stored in Key Vault (never in config files)
+- [ ] ERPNext Integration plugin installed and connected in WordPress
 - [ ] Categories imported (200+ Item Groups)
-- [ ] Warehouses created
-- [ ] Test product syncs successfully
-- [ ] Test order processes end-to-end
-- [ ] Backups configured (`bench backup` cron or Azure Backup)
-- [ ] SSL certificate installed (Let's Encrypt or Azure App Gateway)
-- [ ] Source IP restriction in place (`-AllowedSourceCIDR`)
-- [ ] Secrets moved to Key Vault if not already
+- [ ] Warehouses created with correct addresses
+- [ ] Test product syncs ERPNext → WooCommerce successfully
+- [ ] Test order syncs WooCommerce → ERPNext successfully
+- [ ] Backups configured (`bench backup` cron + Azure Backup for the VM)
+- [ ] SSL configured if you need encrypted traffic even over the private VNet (Let's Encrypt with internal DNS, or front with App Gateway)
+- [ ] Daily/weekly/monthly monitoring routine established
 
 ---
 
 ## Security Recommendations
 
-**Immediate:**
-- Change Administrator password
-- Create per-user accounts (don't use Administrator for daily work)
-- Enable two-factor authentication in ERPNext
+**Immediate (during initial setup):**
 
-**Soon:**
-- Install SSL via Let's Encrypt: `sudo -H bench setup lets-encrypt jtcustomtrailers.local`
-- Configure automated backups to Azure Blob Storage
-- Rotate the credentials in `erpnext-connection-info.json` into Key Vault if you didn't use `-UseKeyVault`
+- Change Administrator password
+- Create per-user accounts in ERPNext — don't use Administrator for daily work
+- Enable two-factor authentication on Administrator
+- Store all credentials in Key Vault, not in config files
+
+**Within the first week:**
+
+- Set up automated daily backups to Azure Blob Storage
+- Configure SSL — even over private VNet, encryption-in-transit is good practice
+- Consider Azure Backup for the VM (snapshots + retention)
 
 **Ongoing:**
-- Monthly `apt update && apt upgrade`
-- Monitor `/var/log/erpnext-install.log` and `bench logs`
-- Quarterly backup restore test
+
+- Monthly `apt update && apt upgrade -y` on the VM
+- Quarterly backup restore test (do a real restore to a throwaway environment)
+- Review ERPNext Error Log weekly
+- Rotate API keys yearly (or after any suspected credential exposure)
 
 ---
 
 ## Cost Estimate
 
-| Item                       | Monthly |
-|----------------------------|---------|
-| Standard_D2s_v6 VM         | ~$70    |
-| 128 GB Premium SSD         | ~$20    |
-| Static Public IP           | ~$4     |
-| Bandwidth (typical)        | ~$5     |
-| **Total**                  | **~$100** |
+| Item | Monthly |
+|---|---|
+| Standard_D2s_v6 VM (westus2) | ~$70 |
+| 128 GB Premium SSD | ~$20 |
+| Key Vault | ~$1 + minimal per-operation |
+| Bandwidth (typical) | ~$5 |
+| **Subtotal — ERPNext only** | **~$95** |
 
-vs QuickBooks Online Plus ($100-$200/month + per-user): ERPNext is cost-equivalent at scale and includes inventory, manufacturing, CRM, and HR.
+If you add an Azure VPN Gateway for access (separate concern):
+
+| Item | Monthly |
+|---|---|
+| VPN Gateway Basic SKU | ~$30 |
+| Or VpnGw1 SKU (better) | ~$140 |
+
+**Versus QuickBooks Online Plus** ($100-$200/month + $11-30/user): ERPNext is cost-equivalent at the application layer and provides inventory, manufacturing, CRM, and HR included. Total cost-of-ownership wins meaningfully at scale.
 
 ---
 
@@ -343,20 +416,30 @@ vs QuickBooks Online Plus ($100-$200/month + per-user): ERPNext is cost-equivale
 ### On your local machine
 ```
 Deploy-ERPNextToAzure.ps1                  Deployment script
-install-erpnext.sh                          Generated install script
-erpnext-connection-info.json                Connection details (if not using Key Vault)
-Deploy-ERPNextToAzure_*.log                 Deployment logs
-Import-ERPNextCategories.ps1                Category import script
+Remove-ERPNextAzureDeployment.ps1          Teardown script
+Select-AzureContext.ps1                    Interactive context selector
+install-erpnext.sh                         Generated install script (per deploy)
+Deploy-ERPNextToAzure_*.log                Deployment logs
+Import-ERPNextCategories.ps1               Category import script
 ```
 
 ### On the Azure VM
 ```
-/home/jtadmin/frappe-bench/                 Main ERPNext directory
-/home/jtadmin/frappe-bench/sites/           Site configurations
-/home/jtadmin/frappe-bench/logs/            Application logs
-/var/log/erpnext-install.log                Install log (this deployment)
-/etc/nginx/                                 Web server config
-/etc/supervisor/conf.d/                     Process management
+/home/jtadmin/frappe-bench/                Main ERPNext directory
+/home/jtadmin/frappe-bench/sites/          Site configurations
+/home/jtadmin/frappe-bench/logs/           Application logs
+/var/log/erpnext-install.log               Install log (this deployment)
+/etc/nginx/                                Web server config
+/etc/supervisor/conf.d/                    Process management
+/etc/supervisor/conf.d/frappe-bench.conf  → ~/frappe-bench/config/supervisor.conf
+```
+
+### In Azure
+```
+RG: JTC-prod-erpnext-westus2-rg            Everything ERPNext-specific
+VNet: jtcustomtr-2e886f0313-vnet            Shared (lives in WP RG)
+Subnet: erpnext-subnet                     Inside shared VNet at 10.0.2.0/27
+KV: JTC-prod-westus2-kv                    All ERPNext secrets
 ```
 
 ---
@@ -367,11 +450,12 @@ Import-ERPNextCategories.ps1                Category import script
 - Frappe Framework: https://frappeframework.com/docs
 - WooCommerce REST API: https://woocommerce.github.io/woocommerce-rest-api-docs/
 - ERPNext Forum: https://discuss.erpnext.com/
+- Frappe Forum: https://discuss.frappe.io/
 - GitHub: https://github.com/JONeillSr/
 
 **Contact:** John O'Neill Sr. — JONeillSr@jtcustomtrailers.com — (440) 813-6695
 
 ---
 
-**Quick Start Guide Version:** 1.5.0
-**Last Updated:** 05/15/2026
+**Quick Start Guide Version:** 1.6.4
+**Last Updated:** 05/16/2026

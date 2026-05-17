@@ -114,6 +114,35 @@
 .PARAMETER InstallTimeoutMinutes
     Timeout in minutes for the ERPNext installation Run Command. Default: 60.
 
+.PARAMETER PrivateOnly
+    Deploy without a public IP. The VM gets only a private NIC and is reachable
+    only from within the VNet, peered VNets, or VPN-connected clients. NSG
+    rules tighten automatically to allow inbound only from the 'VirtualNetwork'
+    service tag. Use this for production deployments accessed via Azure VPN
+    Gateway or VNet peering.
+
+.PARAMETER ExistingVNetName
+    Name of an existing VNet to join. When set, the script does NOT create
+    a new VNet - it adds a subnet to the existing one and places the VM there.
+    Use this when ERPNext needs to communicate privately with other services
+    (e.g., a WordPress App Service) already running in your Azure environment.
+
+.PARAMETER ExistingVNetResourceGroup
+    Resource group containing the existing VNet. Defaults to the deployment
+    RG if not specified. VNets often live in shared/infrastructure RGs that
+    are separate from the application's RG; this lets you specify that.
+
+.PARAMETER SubnetName
+    Name of the subnet to use within the existing VNet. If a subnet with
+    this name already exists, the VM joins it. If it doesn't, the script
+    creates one at the address prefix specified by -SubnetAddressPrefix.
+    Default: erpnext-subnet.
+
+.PARAMETER SubnetAddressPrefix
+    CIDR for a newly-created subnet inside the existing VNet. Must not
+    overlap any existing subnet in that VNet. The script validates this
+    before attempting to create the subnet. Default: 10.0.2.0/27 (32 IPs).
+
 .EXAMPLE
     PS> .\Deploy-ERPNextToAzure.ps1
 
@@ -129,6 +158,19 @@
     PS> .\Deploy-ERPNextToAzure.ps1 -UseKeyVault -KeyVaultName 'JTC-prod-kv-eastus'
 
     Deploys and stores all generated secrets in Azure Key Vault.
+
+.EXAMPLE
+    PS> .\Deploy-ERPNextToAzure.ps1 -ConfirmContext `
+            -UseKeyVault -KeyVaultName 'JTC-prod-westus2-kv' `
+            -Location 'westus2' `
+            -PrivateOnly `
+            -ExistingVNetName 'jtcustomtr-2e886f0313-vnet' `
+            -ExistingVNetResourceGroup 'JTC-Prod-WP-WestUS2-rg'
+
+    Production-style deployment: no public IP, joins an existing VNet
+    (e.g., the one hosting your WordPress App Service), NSG locked to the
+    VirtualNetwork service tag. Reachable only from VPN-connected clients
+    or services running in the same VNet (or peered VNets).
 
 .EXAMPLE
     PS> .\Deploy-ERPNextToAzure.ps1 -SkipInstall
@@ -165,7 +207,7 @@
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Create Date:      02/17/2026
-    Version:          1.5.6
+    Version:          1.6.5
     Last Modified:    05/15/2026
     GitHub:           https://github.com/JONeillSr/
 
@@ -344,7 +386,23 @@ param(
 
     [Parameter()]
     [ValidateRange(10, 240)]
-    [int]$InstallTimeoutMinutes = 60
+    [int]$InstallTimeoutMinutes = 60,
+
+    [Parameter(HelpMessage='Deploy without a public IP. The VM gets only a private NIC and is reachable only from within the VNet (or peered VNets / VPN-connected clients).')]
+    [switch]$PrivateOnly,
+
+    [Parameter(HelpMessage='Name of an existing VNet to join. When set, the script does NOT create a new VNet. Use with -ExistingVNetResourceGroup if the VNet lives in a different RG.')]
+    [string]$ExistingVNetName,
+
+    [Parameter(HelpMessage='Resource group containing the existing VNet (defaults to the deployment RG if not set).')]
+    [string]$ExistingVNetResourceGroup,
+
+    [Parameter(HelpMessage='Name of the subnet to use within the existing VNet. Created if missing. Default: erpnext-subnet.')]
+    [string]$SubnetName = 'erpnext-subnet',
+
+    [Parameter(HelpMessage='CIDR for a newly-created subnet inside the existing VNet. Must not overlap any existing subnet. Default: 10.0.2.0/27.')]
+    [ValidatePattern('^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$')]
+    [string]$SubnetAddressPrefix = '10.0.2.0/27'
 )
 
 #Requires -Version 7.2
@@ -354,8 +412,21 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# If the user changed -Location but accepted the default RG/VM names (which
+# embed "eastus"), substitute the new location into those names so the
+# resource names stay consistent with where they actually live. The user
+# can still override by passing explicit -ResourceGroupName / -VMName.
+if ($Location -ne 'eastus') {
+    if ($PSBoundParameters.Keys -notcontains 'ResourceGroupName') {
+        $ResourceGroupName = $ResourceGroupName -replace '-eastus-', "-$Location-"
+    }
+    if ($PSBoundParameters.Keys -notcontains 'VMName') {
+        $VMName = $VMName -replace '-eastus-', "-$Location-"
+    }
+}
+
 # Script configuration
-$ScriptVersion = "1.5.6"
+$ScriptVersion = "1.6.5"
 $CompanyName = "JT Custom Trailers"
 $LogFile = Join-Path $PSScriptRoot "Deploy-ERPNextToAzure_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
@@ -580,6 +651,69 @@ function New-NSGRuleSet {
     }
 
     return $configs
+}
+
+function Test-CIDROverlap {
+    <#
+    .SYNOPSIS
+        Returns $true if two IPv4 CIDR blocks overlap, $false otherwise.
+
+    .DESCRIPTION
+        Used when adding a new subnet to an existing VNet to make sure we
+        don't collide with subnets that are already there. The check converts
+        each CIDR to a [start, end] range of unsigned 32-bit integers and
+        tests for overlap with the standard "start1 <= end2 AND start2 <= end1"
+        formula.
+
+    .EXAMPLE
+        Test-CIDROverlap -CIDR1 '10.0.2.0/27' -CIDR2 '10.0.0.0/25'
+        # Returns False - they don't overlap.
+
+        Test-CIDROverlap -CIDR1 '10.0.0.0/24' -CIDR2 '10.0.0.128/25'
+        # Returns True - 10.0.0.128/25 is inside 10.0.0.0/24.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$CIDR1,
+        [Parameter(Mandatory)] [string]$CIDR2
+    )
+
+    function ConvertTo-Range($cidr) {
+        $parts = $cidr -split '/'
+        $ipBytes = [System.Net.IPAddress]::Parse($parts[0]).GetAddressBytes()
+        # IPv4 bytes come back in network byte order; reverse for proper integer.
+        [Array]::Reverse($ipBytes)
+
+        # Convert the four bytes to a uint64-compatible integer directly.
+        # We avoid PowerShell hex literals (which parse ambiguously between
+        # int/uint32/long) and the -bnot operator entirely. All arithmetic
+        # is done with explicit uint64 values, which has plenty of headroom
+        # for any 32-bit IPv4 address space math. Cast each byte to uint64
+        # FIRST (parens around the cast) so the shift operator works on the
+        # already-widened value rather than on a narrower type.
+        $b0 = [uint64]$ipBytes[0]
+        $b1 = [uint64]$ipBytes[1]
+        $b2 = [uint64]$ipBytes[2]
+        $b3 = [uint64]$ipBytes[3]
+        $ipInt = ($b3 * 16777216) + ($b2 * 65536) + ($b1 * 256) + $b0
+
+        $prefix = [int]$parts[1]
+        $hostBits = 32 - $prefix
+        # 2^32 = 4294967296 is the size of the whole IPv4 address space.
+        # blockSize is the number of addresses in the prefix.
+        $blockSize = [uint64][math]::Pow(2, $hostBits)
+        $maxAddr = [uint64]4294967295  # 2^32 - 1, written as decimal to avoid hex-literal parsing issues
+        $mask = if ($prefix -eq 0) { [uint64]0 } else { $maxAddr - ($blockSize - 1) }
+        $start = $ipInt -band $mask
+        $end   = $start + $blockSize - 1
+        return @($start, $end)
+    }
+
+    $r1 = ConvertTo-Range $CIDR1
+    $r2 = ConvertTo-Range $CIDR2
+
+    # Overlap iff r1.start <= r2.end AND r2.start <= r1.end
+    return ($r1[0] -le $r2[1]) -and ($r2[0] -le $r1[1])
 }
 
 function Get-CurrentPrincipalObjectId {
@@ -1182,54 +1316,177 @@ try {
     }
 
     # ---- Network: NSG ----
+    # NSG rules tighten dramatically in PrivateOnly mode: source becomes the
+    # VirtualNetwork service tag which only includes the VNet's own address
+    # space, peered VNets, and VPN client pools. No public ingress allowed.
     Write-LogMessage "Network Security Group: $VMName-nsg" -Level Info
     $nsgName = "$VMName-nsg"
     $nsg = Get-AzNetworkSecurityGroup -Name $nsgName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
     if (-not $nsg) {
-        $nsgRules = New-NSGRuleSet -SourcePrefix $AllowedSourceCIDR
+        if ($PrivateOnly) {
+            $nsgRules = New-NSGRuleSet -SourcePrefix 'VirtualNetwork'
+            $nsgSourceLabel = 'VirtualNetwork (private only)'
+        } else {
+            $nsgRules = New-NSGRuleSet -SourcePrefix $AllowedSourceCIDR
+            $nsgSourceLabel = $AllowedSourceCIDR
+        }
         $nsg = New-AzNetworkSecurityGroup -ResourceGroupName $ResourceGroupName `
             -Location $Location -Name $nsgName -SecurityRules $nsgRules
-        Write-LogMessage "  Created. Source prefix: $AllowedSourceCIDR" -Level Success
+        Write-LogMessage "  Created. Source: $nsgSourceLabel" -Level Success
     } else {
         Write-LogMessage "  Already exists." -Level Info
     }
 
-    # ---- Network: Public IP ----
-    Write-LogMessage "Public IP: $VMName-pip" -Level Info
-    $pipName = "$VMName-pip"
-    $publicIp = Get-AzPublicIpAddress -Name $pipName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
-    if (-not $publicIp) {
-        $publicIp = New-AzPublicIpAddress -Name $pipName -ResourceGroupName $ResourceGroupName `
-            -Location $Location -AllocationMethod Static -Sku Standard
-        Write-LogMessage "  Created." -Level Success
+    # ---- Network: Public IP (only in public-access mode) ----
+    $publicIp = $null
+    if (-not $PrivateOnly) {
+        Write-LogMessage "Public IP: $VMName-pip" -Level Info
+        $pipName = "$VMName-pip"
+        $publicIp = Get-AzPublicIpAddress -Name $pipName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+        if (-not $publicIp) {
+            $publicIp = New-AzPublicIpAddress -Name $pipName -ResourceGroupName $ResourceGroupName `
+                -Location $Location -AllocationMethod Static -Sku Standard
+            Write-LogMessage "  Created." -Level Success
+        } else {
+            Write-LogMessage "  Already exists." -Level Info
+        }
     } else {
-        Write-LogMessage "  Already exists." -Level Info
+        Write-LogMessage "Public IP: skipped (-PrivateOnly mode)" -Level Info
     }
 
     # ---- Network: VNet + Subnet ----
-    Write-LogMessage "Virtual Network: $VMName-vnet" -Level Info
-    $vnetName = "$VMName-vnet"
-    $subnetName = "$VMName-subnet"
-    $vnet = Get-AzVirtualNetwork -Name $vnetName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
-    if (-not $vnet) {
-        $subnetConfig = New-AzVirtualNetworkSubnetConfig -Name $subnetName `
-            -AddressPrefix "10.0.1.0/24" -NetworkSecurityGroup $nsg
-        $vnet = New-AzVirtualNetwork -Name $vnetName -ResourceGroupName $ResourceGroupName `
-            -Location $Location -AddressPrefix "10.0.0.0/16" -Subnet $subnetConfig
-        Write-LogMessage "  Created." -Level Success
+    # Two modes:
+    #   1. Existing-VNet: join a VNet the user already has. Create just a subnet inside it.
+    #   2. Standalone: create a fresh isolated VNet just for this deployment.
+    $targetSubnetId = $null
+
+    if ($ExistingVNetName) {
+        $vnetRG = if ($ExistingVNetResourceGroup) { $ExistingVNetResourceGroup } else { $ResourceGroupName }
+        Write-LogMessage "Joining existing VNet: $ExistingVNetName (RG: $vnetRG)" -Level Info
+
+        $existingVNet = Get-AzVirtualNetwork -Name $ExistingVNetName -ResourceGroupName $vnetRG -ErrorAction SilentlyContinue
+        if (-not $existingVNet) {
+            throw "ExistingVNetName '$ExistingVNetName' not found in resource group '$vnetRG'."
+        }
+
+        # Region must match - VMs and VNets must be in the same region.
+        if ($existingVNet.Location -ne $Location) {
+            throw "VNet '$ExistingVNetName' is in region '$($existingVNet.Location)' but the deployment is targeting '$Location'. They must match. Re-run with -Region '$($existingVNet.Location)'."
+        }
+
+        # Look for existing subnet with our target name; create it if missing.
+        $existingSubnet = $existingVNet.Subnets | Where-Object { $_.Name -eq $SubnetName }
+        if ($existingSubnet) {
+            Write-LogMessage "  Subnet '$SubnetName' already exists at $($existingSubnet.AddressPrefix)" -Level Info
+            $targetSubnetId = $existingSubnet.Id
+        } else {
+            Write-LogMessage "  Creating subnet '$SubnetName' at $SubnetAddressPrefix in $ExistingVNetName..." -Level Info
+
+            # Pre-flight: verify the requested subnet CIDR fits inside the VNet's
+            # address space. Azure returns a confusing NetcfgSubnetRangeOutsideVnet
+            # error if it doesn't, and we'd rather catch it here with actionable
+            # guidance. The VNet may have multiple address prefixes (it's a list,
+            # not a single value), so we check the requested CIDR against each
+            # prefix and only fail if it doesn't fit any of them.
+            $vnetPrefixes = @($existingVNet.AddressSpace.AddressPrefixes)
+            $fitsInVNet = $false
+            foreach ($vp in $vnetPrefixes) {
+                try {
+                    # If requested CIDR is fully contained in a VNet prefix, that
+                    # means: subnet start >= prefix start AND subnet end <= prefix end.
+                    # We can determine "contained" using the overlap check: if the
+                    # subnet overlaps the prefix AND the prefix's bits are <= subnet's
+                    # bits (i.e., prefix is a superset).
+                    $subnetParts = $SubnetAddressPrefix -split '/'
+                    $vnetParts   = $vp -split '/'
+                    $subnetMaskBits = [int]$subnetParts[1]
+                    $vnetMaskBits   = [int]$vnetParts[1]
+                    if ($vnetMaskBits -le $subnetMaskBits) {
+                        # VNet prefix is equal or larger than subnet (i.e., could contain it).
+                        # Now check that the subnet's network address actually falls inside.
+                        if (Test-CIDROverlap -CIDR1 $SubnetAddressPrefix -CIDR2 $vp) {
+                            $fitsInVNet = $true
+                            break
+                        }
+                    }
+                } catch {
+                    # Math helper failed - just defer to Azure for the real check.
+                    Write-LogMessage "  (Pre-flight VNet-fit check failed: $($_.Exception.Message). Proceeding to Azure API.)" -Level Debug
+                    $fitsInVNet = $true  # don't block on helper failure
+                    break
+                }
+            }
+
+            if (-not $fitsInVNet) {
+                $vnetSpaceList = $vnetPrefixes -join ', '
+                throw "Requested subnet $SubnetAddressPrefix does not fit inside the VNet's address space ($vnetSpaceList). Either pass -SubnetAddressPrefix with a CIDR inside that range, or expand the VNet's address space first with:`n`n  `$vnet = Get-AzVirtualNetwork -Name '$ExistingVNetName' -ResourceGroupName '$vnetRG'`n  `$vnet.AddressSpace.AddressPrefixes.Add('10.0.2.0/24')`n  `$vnet | Set-AzVirtualNetwork`n`nThen re-run this deploy. Expanding a VNet's address space is non-disruptive - existing subnets and resources are unaffected."
+            }
+
+            # Check that the requested CIDR doesn't overlap any existing subnet.
+            # The check is a safety net, not a hard requirement - if our math
+            # fails for any reason, Azure's API will still catch a real overlap
+            # when we try to add the subnet. So we log a warning and proceed
+            # rather than aborting deployment on a CIDR-helper bug.
+            foreach ($s in $existingVNet.Subnets) {
+                $existingPrefix = if ($s.AddressPrefix -is [array]) { $s.AddressPrefix[0] } else { $s.AddressPrefix }
+                try {
+                    if (Test-CIDROverlap -CIDR1 $SubnetAddressPrefix -CIDR2 $existingPrefix) {
+                        throw "Requested subnet $SubnetAddressPrefix overlaps existing subnet '$($s.Name)' at $existingPrefix. Choose a different -SubnetAddressPrefix."
+                    }
+                } catch {
+                    # If the error is our own overlap-detection throw, re-raise it.
+                    # Otherwise (math failure, parse error, etc.), warn and continue.
+                    if ($_.Exception.Message -like '*overlaps existing subnet*') { throw }
+                    Write-LogMessage "  (CIDR overlap helper failed for '$existingPrefix': $($_.Exception.Message). Skipping pre-check; Azure API will validate.)" -Level Warning
+                }
+            }
+
+            # Add the subnet. We pass the NSG so it's bound at creation.
+            Add-AzVirtualNetworkSubnetConfig -Name $SubnetName -VirtualNetwork $existingVNet `
+                -AddressPrefix $SubnetAddressPrefix -NetworkSecurityGroup $nsg | Out-Null
+            $existingVNet | Set-AzVirtualNetwork | Out-Null
+
+            # Re-fetch to pick up the new subnet's ID
+            $existingVNet = Get-AzVirtualNetwork -Name $ExistingVNetName -ResourceGroupName $vnetRG
+            $newSubnet = $existingVNet.Subnets | Where-Object { $_.Name -eq $SubnetName }
+            $targetSubnetId = $newSubnet.Id
+            Write-LogMessage "  Subnet created. Note: this subnet lives in RG '$vnetRG', not the ERPNext RG." -Level Success
+        }
     } else {
-        Write-LogMessage "  Already exists." -Level Info
+        Write-LogMessage "Virtual Network: $VMName-vnet" -Level Info
+        $vnetName = "$VMName-vnet"
+        $standaloneSubnetName = "$VMName-subnet"
+        $vnet = Get-AzVirtualNetwork -Name $vnetName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
+        if (-not $vnet) {
+            $subnetConfig = New-AzVirtualNetworkSubnetConfig -Name $standaloneSubnetName `
+                -AddressPrefix "10.0.1.0/24" -NetworkSecurityGroup $nsg
+            $vnet = New-AzVirtualNetwork -Name $vnetName -ResourceGroupName $ResourceGroupName `
+                -Location $Location -AddressPrefix "10.0.0.0/16" -Subnet $subnetConfig
+            Write-LogMessage "  Created." -Level Success
+        } else {
+            Write-LogMessage "  Already exists." -Level Info
+        }
+        $targetSubnetId = $vnet.Subnets[0].Id
     }
 
     # ---- Network: NIC ----
+    # In PrivateOnly mode, no public IP is associated with the NIC.
     Write-LogMessage "Network Interface: $VMName-nic" -Level Info
     $nicName = "$VMName-nic"
     $nic = Get-AzNetworkInterface -Name $nicName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
     if (-not $nic) {
-        $nic = New-AzNetworkInterface -Name $nicName -ResourceGroupName $ResourceGroupName `
-            -Location $Location -SubnetId $vnet.Subnets[0].Id `
-            -PublicIpAddressId $publicIp.Id -NetworkSecurityGroupId $nsg.Id
-        Write-LogMessage "  Created." -Level Success
+        $nicParams = @{
+            Name                   = $nicName
+            ResourceGroupName      = $ResourceGroupName
+            Location               = $Location
+            SubnetId               = $targetSubnetId
+            NetworkSecurityGroupId = $nsg.Id
+        }
+        if ($publicIp) {
+            $nicParams['PublicIpAddressId'] = $publicIp.Id
+        }
+        $nic = New-AzNetworkInterface @nicParams
+        Write-LogMessage "  Created$(if ($PrivateOnly) { ' (private IP only)' })." -Level Success
     } else {
         Write-LogMessage "  Already exists." -Level Info
     }
@@ -1270,9 +1527,22 @@ try {
         Write-LogMessage "  VM created successfully." -Level Success
     }
 
-    # Resolve public IP for output
-    $publicIpAddress = (Get-AzPublicIpAddress -Name $pipName -ResourceGroupName $ResourceGroupName).IpAddress
-    Write-LogMessage "Public IP: $publicIpAddress" -Level Success
+    # Resolve the VM's primary access IP. In PrivateOnly mode this is the
+    # private IP from the NIC; otherwise it's the public IP.
+    if ($PrivateOnly) {
+        $nicResolved = Get-AzNetworkInterface -Name $nicName -ResourceGroupName $ResourceGroupName
+        $vmAccessIp = $nicResolved.IpConfigurations[0].PrivateIpAddress
+        Write-LogMessage "Private IP: $vmAccessIp" -Level Success
+        # Keep variable name for backward-compat with downstream code, but log
+        # accurately. $publicIpAddress used to mean "the IP people use to reach
+        # ERPNext"; in PrivateOnly mode it's the private IP.
+        $publicIpAddress = $vmAccessIp
+        $vmAccessIpKind = 'Private'
+    } else {
+        $publicIpAddress = (Get-AzPublicIpAddress -Name $pipName -ResourceGroupName $ResourceGroupName).IpAddress
+        Write-LogMessage "Public IP: $publicIpAddress" -Level Success
+        $vmAccessIpKind = 'Public'
+    }
 
     # ---- ERPNext install script generation ----
     Write-LogMessage "Generating ERPNext installation script..." -Level Info
@@ -1543,13 +1813,15 @@ NEWSITE_EOF
     $connectionInfo = [ordered]@{
         VMName               = $VMName
         ResourceGroup        = $ResourceGroupName
-        PublicIP             = $publicIpAddress
+        IPAddressKind        = $vmAccessIpKind  # 'Public' or 'Private'
+        IPAddress            = $publicIpAddress  # The actual IP (private or public)
+        PublicIP             = $publicIpAddress  # Kept for backward-compat with v1.5.x consumers
         AdminUsername        = $AdminUsername
         SSHCommand           = "ssh ${AdminUsername}@${publicIpAddress}"
         ERPNextURL           = "http://${publicIpAddress}"
         ERPNextUsername      = "Administrator"
         InstallScriptPath    = $scriptPath
-        LogFile              = $LogFile
+        LogFile               = $LogFile
         DeploymentTime       = (Get-Date -Format 'o')
         ScriptVersion        = $ScriptVersion
     }
@@ -1577,7 +1849,11 @@ NEWSITE_EOF
     Write-Host ""
     Write-Host "VM Details:" -ForegroundColor Cyan
     Write-Host "  Name:             $VMName"
-    Write-Host "  Public IP:        $publicIpAddress"
+    if ($vmAccessIpKind -eq 'Public') {
+        Write-Host "  Public IP:        $publicIpAddress"
+    } else {
+        Write-Host "  Private IP:       $publicIpAddress (no public IP - VPN/VNet access only)"
+    }
     Write-Host "  Admin Username:   $AdminUsername"
     if ($UseKeyVault) {
         Write-Host "  Secrets:          Key Vault $KeyVaultName" -ForegroundColor Yellow
@@ -1588,6 +1864,9 @@ NEWSITE_EOF
     Write-Host ""
     Write-Host "Access ERPNext:" -ForegroundColor Cyan
     Write-Host "  URL:  http://${publicIpAddress}"
+    if ($vmAccessIpKind -eq 'Private') {
+        Write-Host "        (reachable from VPN-connected clients or VNet-attached services)" -ForegroundColor DarkGray
+    }
     Write-Host "  User: Administrator"
     Write-Host ""
     Write-Host "Next Steps:" -ForegroundColor Cyan

@@ -3,8 +3,18 @@
 
 **Author:** John O'Neill Sr.  
 **Company:** Azure Innovators  
-**Create Date:** 02/17/2026  
-**Version:** 1.0.0
+**Original Create Date:** 02/17/2026  
+**Last Updated:** 05/16/2026
+**Version:** 1.0.1
+
+---
+
+## Revision history
+
+- **1.0.1 (05/16/2026):** Header date refresh; added category currency note; added deployment-architecture reference noting the move to private-network deployment. No changes to the data model itself.
+- **1.0.0 (02/17/2026):** Initial release.
+
+> **About category data in this document:** The category structure listed below reflects WooCommerce categories as of February 2026. The catalog has evolved since then. **Verify against your current `ProductCategories.xlsx` before relying on specific counts or names below.** The mapping methodology and ERPNext data model are unchanged regardless of which categories are current.
 
 ---
 
@@ -654,39 +664,43 @@ Your Build_Tracking_Worksheet.pdf shows:
 
 ## Migration Timeline
 
-### Phase 1: Setup and Configuration (Week 1-2)
+> **Note:** This timeline reflects the original waterfall plan from February 2026. Since then, deployment has moved to an automated PowerShell pipeline (10-15 minutes vs. 1-2 days originally estimated) and the WooCommerce integration approach has changed (WordPress-side plugin vs. ERPNext-side app). The week structure below is still useful as a *sequence* but the *durations* compress considerably with the current tooling.
 
-**Week 1:**
-- Day 1-2: Deploy ERPNext to Azure VM
-- Day 3-4: Install WooCommerce Connector
-- Day 5-7: Create custom fields and configure
+### Phase 1: Setup and Configuration (Week 1)
+
+**Day 1:**
+- Deploy ERPNext to Azure with `Deploy-ERPNextToAzure.ps1` in `-PrivateOnly` mode (10-15 min)
+- Generate ERPNext API credentials, store in Key Vault
+- Install WordPress-side ERPNext Integration plugin (the v15+ recommended approach — the old `bench get-app woocommerceconnector` pattern is deprecated)
+- Configure the integration plugin to point at the ERPNext private IP
+
+**Day 2-3:**
+- Run `Import-ERPNextCategories.ps1` to seed Item Groups (current `ProductCategories.xlsx`)
+- Configure warehouses (Main Warehouse - Ashtabula, Showroom - Jefferson)
+- Set up suppliers and initial customer records
+- Configure custom fields per Section 6
+
+### Phase 2: Data Migration (Week 2-3)
 
 **Week 2:**
-- Day 1-2: Import categories (use script)
-- Day 3-4: Configure warehouses
-- Day 5-7: Set up suppliers, customers
-
-### Phase 2: Data Migration (Week 3-4)
-
-**Week 3:**
-- Day 1-3: Import product data
-- Day 4-5: Verify product sync to WooCommerce
+- Day 1-3: Import product data via Data Import tool
+- Day 4-5: Verify product sync to WooCommerce (via the WP integration plugin)
 - Day 6-7: Import opening stock balances
 
-**Week 4:**
+**Week 3:**
 - Day 1-2: Import customer data
 - Day 3-4: Historical order import (optional)
 - Day 5-7: Testing and validation
 
-### Phase 3: Go-Live (Week 5)
+### Phase 3: Go-Live (Week 4)
 
-**Week 5:**
-- Day 1-2: Enable WooCommerce order sync
-- Day 3-4: Monitor synchronization
-- Day 5: Train staff
+**Week 4:**
+- Day 1-2: Enable WooCommerce → ERPNext order sync
+- Day 3-4: Monitor synchronization closely
+- Day 5: Train staff (the WP integration UI lives on the WordPress side, which your team is already familiar with)
 - Day 6-7: Full operation
 
-### Phase 4: Optimization (Week 6+)
+### Phase 4: Optimization (Week 5+)
 
 - Fine-tune sync intervals
 - Optimize workflows
@@ -812,6 +826,6 @@ For assistance with this migration:
 
 ---
 
-**Document Version:** 1.0.0  
-**Last Updated:** 02/17/2026  
-**Next Review:** 03/17/2026
+**Document Version:** 1.0.1
+**Last Updated:** 05/16/2026
+**Next Review:** 08/16/2026
