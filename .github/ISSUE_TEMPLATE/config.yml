@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ERPNext documentation
+    url: https://docs.erpnext.com/
+    about: For ERPNext application questions (DocTypes, Workflows, accounting, etc.) - not deployment automation
+  - name: Frappe Framework documentation
+    url: https://frappeframework.com/docs
+    about: For Frappe/Bench framework questions
+  - name: Frappe / ERPNext Community Forum
+    url: https://discuss.frappe.io/
+    about: For ERPNext usage questions and community support
+  - name: Azure Virtual Machines documentation
+    url: https://learn.microsoft.com/en-us/azure/virtual-machines/
+    about: For general Azure VM questions not specific to ERPNext deployment

@@ -1,0 +1,99 @@
+# =============================================================================
+# Script log files
+# =============================================================================
+# The scripts generate timestamped logs next to themselves during testing.
+*.log
+Deploy-ERPNextToAzure_*.log
+Remove-ERPNextAzureDeployment_*.log
+Select-AzureContext_*.log
+Import-ERPNextCategories_*.log
+Setup-AzureP2SVPN_*.log
+
+# =============================================================================
+# Generated artifacts from script runs
+# =============================================================================
+# The deploy script generates a bash installation script next to itself
+# (install-erpnext.sh). It's regenerated on every run and contains tenant-
+# and deployment-specific values that shouldn't be committed.
+install-erpnext.sh
+install-erpnext-*.sh
+
+# CSV files generated or used during category imports
+TestInputFile.csv
+*-import-results.csv
+
+# =============================================================================
+# Secrets / credential leak patterns
+# =============================================================================
+# Belt-and-suspenders. The scripts use Azure Key Vault for real secrets but
+# operators sometimes save temporary local copies during troubleshooting.
+*.env
+.env.*
+*secret*.json
+*credentials*.json
+*.pfx
+*.cer
+*.key
+*.pem
+local-config.ps1
+local-vars.ps1
+deploy-vars.ps1
+azure-creds.ps1
+
+# SSH keys that might end up here during troubleshooting
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+*.ppk
+
+# VPN config bundles (if you keep both scripts in this repo)
+*vpnclientconfiguration*.zip
+azurevpnconfig*.xml
+vpnconfig*.zip
+
+# =============================================================================
+# Frappe / ERPNext local testing artifacts
+# =============================================================================
+# If you ever run bench locally during script development:
+sites/
+bench-repo/
+__pycache__/
+*.pyc
+node_modules/
+*.lock
+
+# =============================================================================
+# Editor / IDE files
+# =============================================================================
+.vscode/launch.json
+.vscode/tasks.json
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# PowerShell-specific
+PSScriptAnalyzer-*.log
+*.pssa-result.xml
+
+# =============================================================================
+# OS-specific clutter
+# =============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =============================================================================
+# Output staging / scratch
+# =============================================================================
+out/
+output/
+artifacts/
+scratch.ps1
+test-local.ps1
+notes.md
+NOTES.md
+TODO.md
