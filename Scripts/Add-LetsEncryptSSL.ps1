@@ -58,11 +58,18 @@
 .PARAMETER PublicZoneResourceGroup
     Resource group containing the public DNS zone.
 
-.PARAMETER SiteName
-    Name of the ERPNext site (the directory under frappe-bench/sites/). For
-    a single-site deployment this is usually the FQDN, e.g.
-    'erpnext.awesomewildstuff.com'. If unspecified, the script will try to
-    auto-detect it by listing the sites directory on the VM.
+.PARAMETER PublicFQDN
+    Public FQDN that users will type in their browser to reach ERPNext, e.g.,
+    'erpnext.awesomewildstuff.com'. This goes into the site_config.json as
+    host_name and into the domains array. nginx will serve SSL on this name.
+
+.PARAMETER FrappeSiteDir
+    Name of the Frappe site directory under frappe-bench/sites/. Important:
+    this is the INTERNAL Frappe site identifier, which is OFTEN DIFFERENT
+    from the public FQDN. For example, you might have a site directory called
+    'jtcustomtrailers.local' that's accessed publicly as
+    'erpnext.awesomewildstuff.com'. If unspecified, the script auto-detects
+    by scanning the sites/ directory for the single non-asset entry.
 
 .PARAMETER FrappeBenchPath
     Path to the frappe-bench directory on the VM. Default: /home/<adminuser>/frappe-bench.
@@ -113,11 +120,14 @@
             -ERPNextVMResourceGroup 'JTC-prod-erpnext-westus2-rg' `
             -PublicZoneName 'awesomewildstuff.com' `
             -PublicZoneResourceGroup 'AWS-Prod-EastUS-rg' `
-            -SiteName 'erpnext.awesomewildstuff.com' `
+            -PublicFQDN 'erpnext.awesomewildstuff.com' `
+            -FrappeSiteDir 'jtcustomtrailers.local' `
             -FrappeAdminUser 'jtadmin' `
             -ContactEmail 'admin@awesomewildstuff.com'
 
-    Real-world JTC scenario: provision SSL for the JTC ERPNext deployment.
+    Real-world JTC scenario: ERPNext is accessed at the public FQDN
+    'erpnext.awesomewildstuff.com', but the internal Frappe site directory
+    is 'jtcustomtrailers.local' (chosen during initial deployment).
 
 .EXAMPLE
     PS> .\Add-LetsEncryptSSL.ps1 -ConfirmContext `
@@ -125,19 +135,20 @@
             -ERPNextVMResourceGroup 'contoso-prod-rg' `
             -PublicZoneName 'contoso.com' `
             -PublicZoneResourceGroup 'contoso-dns-rg' `
-            -SiteName 'erpnext.contoso.com' `
+            -PublicFQDN 'erpnext.contoso.com' `
             -FrappeAdminUser 'azureadmin' `
             -ContactEmail 'admin@contoso.com' `
             -UseStaging
 
     Test the setup against Let's Encrypt staging first to avoid hitting
-    production rate limits during debugging.
+    production rate limits during debugging. -FrappeSiteDir omitted
+    so the script auto-detects the site directory.
 
 .NOTES
     Author:           John O'Neill Sr.
     Company:          Azure Innovators
     Created:          05/17/2026
-    Version:          1.0.0
+    Version:          1.0.2
     Last Updated:     05/17/2026
 
     REQUIREMENTS:
@@ -209,8 +220,12 @@ param(
     [ValidatePattern('^[^@\s]+@[^@\s]+\.[^@\s]+$')]
     [string]$ContactEmail,
 
-    [Parameter(HelpMessage = 'ERPNext site name (FQDN, matches site directory). Auto-detected if not specified.')]
-    [string]$SiteName,
+    [Parameter(Mandatory, HelpMessage = 'Public FQDN users will type to reach ERPNext (e.g., erpnext.awesomewildstuff.com).')]
+    [ValidateNotNullOrEmpty()]
+    [string]$PublicFQDN,
+
+    [Parameter(HelpMessage = 'Frappe site directory name (often differs from FQDN, e.g., jtcustomtrailers.local). Auto-detected if not specified.')]
+    [string]$FrappeSiteDir,
 
     [Parameter(HelpMessage = 'Path to frappe-bench on the VM. Default: /home/<FrappeAdminUser>/frappe-bench.')]
     [string]$FrappeBenchPath,
@@ -247,7 +262,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.0.2'
 
 # Logging
 $LogTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -359,10 +374,41 @@ function Invoke-VMScript {
         [switch]$IgnoreFailure
     )
 
+    # SENTINEL-BASED FAILURE DETECTION
+    #
+    # Azure Run Command doesn't surface bash exit codes the way we'd like, and
+    # in past versions of this script we tried to detect failures by string-
+    # matching stderr for words like "Error". That approach silently misses
+    # whole categories of bugs:
+    #
+    #   - bash script aborts on first `set -e` failure before producing stderr
+    #   - script runs successfully but tools printed warnings that match "Error"
+    #   - script runs partially, then exits cleanly without finishing
+    #
+    # The fix: every bash script we send to the VM MUST end with `set -e` at
+    # the top AND echo "__STEP_OK__" as its final line. If we don't see that
+    # exact sentinel in stdout, the script did NOT complete and we throw.
+    #
+    # This converts "hope it worked" into "verified it worked."
+    $sentinelMarker = '__STEP_OK__'
+
+    # Auto-prepend `set -e` if not already there. Subtle requirement: many
+    # bash subshells (like sudo -u ... bash -c) don't inherit set -e from the
+    # outer script. Caller is responsible for adding `set -e` inside those.
+    $finalScript = $ScriptText
+    if ($finalScript -notmatch '(?m)^\s*set\s+-e') {
+        $finalScript = "set -e`n" + $finalScript
+    }
+
+    # Auto-append the sentinel echo if not already there
+    if ($finalScript -notmatch [Regex]::Escape($sentinelMarker)) {
+        $finalScript = $finalScript.TrimEnd() + "`necho '$sentinelMarker'`n"
+    }
+
     Write-LogMessage "  Running on VM: $Description..." -Level Debug
 
     $result = Invoke-AzVMRunCommand -ResourceGroupName $ResourceGroup -Name $VMName `
-        -CommandId 'RunShellScript' -ScriptString $ScriptText -ErrorAction Stop
+        -CommandId 'RunShellScript' -ScriptString $finalScript -ErrorAction Stop
 
     $stdout = ''
     $stderr = ''
@@ -371,28 +417,30 @@ function Invoke-VMScript {
         if ($v.Code -like '*StdErr*') { $stderr = $v.Message }
     }
 
-    # Log truncated outputs
+    # Log outputs (truncated for readability)
     if ($stdout) {
-        $shortOut = if ($stdout.Length -gt 400) { $stdout.Substring(0, 400) + '...(truncated)' } else { $stdout }
+        $shortOut = if ($stdout.Length -gt 600) { $stdout.Substring(0, 600) + '...(truncated)' } else { $stdout }
         Write-LogMessage "    STDOUT: $shortOut" -Level Debug
     }
     if ($stderr) {
-        $shortErr = if ($stderr.Length -gt 400) { $stderr.Substring(0, 400) + '...(truncated)' } else { $stderr }
+        $shortErr = if ($stderr.Length -gt 600) { $stderr.Substring(0, 600) + '...(truncated)' } else { $stderr }
         Write-LogMessage "    STDERR: $shortErr" -Level Debug
     }
 
-    # Run Command doesn't directly report exit codes, but stderr with content
-    # that looks like an error usually indicates trouble. We check for common
-    # error patterns and let the caller decide if they care.
-    $looksLikeError = $stderr -and ($stderr -match 'Error|Failed|fatal|cannot' -and $stderr -notmatch 'Setting up')
-    if ($looksLikeError -and -not $IgnoreFailure) {
-        Write-LogMessage "    Possible failure detected in script output." -Level Warning
-        Write-LogMessage "    Full stderr: $stderr" -Level Warning
+    # Sentinel check: if the script ran to completion, the marker MUST be in stdout.
+    $sawSentinel = $stdout -match [Regex]::Escape($sentinelMarker)
+
+    if (-not $sawSentinel -and -not $IgnoreFailure) {
+        $errSummary = if ($stderr) { $stderr } else { '(no stderr captured)' }
+        $outSummary = if ($stdout) { $stdout } else { '(no stdout captured)' }
+        throw "VM script failed: '$Description' did not complete (no success sentinel in stdout). " +
+              "Full output:`n--- STDOUT ---`n$outSummary`n--- STDERR ---`n$errSummary"
     }
 
     return @{
         StdOut = $stdout
         StdErr = $stderr
+        Success = $sawSentinel
     }
 }
 
@@ -426,7 +474,11 @@ try {
     if (-not $dnsZone) {
         throw "Public DNS zone '$PublicZoneName' not found in '$PublicZoneResourceGroup'."
     }
-    Write-LogMessage "  Public zone found. Resource ID: $($dnsZone.Id)" -Level Success
+    # The DnsZone object returned by Get-AzDnsZone doesn't expose an Id property,
+    # so we construct the resource ID manually from the well-known ARM path format.
+    # This is the value certbot-dns-azure needs in its INI file.
+    $dnsZoneResourceId = "/subscriptions/$($context.Subscription.Id)/resourceGroups/$PublicZoneResourceGroup/providers/Microsoft.Network/dnszones/$PublicZoneName"
+    Write-LogMessage "  Public zone found. Resource ID: $dnsZoneResourceId" -Level Success
 
     # ---- Pre-flight: managed identity RG exists ----
     $miRG = Get-AzResourceGroup -Name $ManagedIdentityResourceGroup -ErrorAction SilentlyContinue
@@ -442,13 +494,14 @@ try {
     Write-Host "  ERPNext VM:             $ERPNextVMName (RG: $ERPNextVMResourceGroup)"
     Write-Host "  Public DNS Zone:        $PublicZoneName (RG: $PublicZoneResourceGroup)"
     Write-Host "  Wildcard Cert:          *.$PublicZoneName, $PublicZoneName"
+    Write-Host "  Public FQDN (for site): $PublicFQDN"
     Write-Host "  Managed Identity:       $ManagedIdentityName (RG: $ManagedIdentityResourceGroup)"
     Write-Host "  Frappe Admin User:      $FrappeAdminUser"
     Write-Host "  Frappe Bench Path:      $FrappeBenchPath"
-    if ($SiteName) {
-        Write-Host "  ERPNext Site:           $SiteName"
+    if ($FrappeSiteDir) {
+        Write-Host "  Frappe Site Dir:        $FrappeSiteDir"
     } else {
-        Write-Host "  ERPNext Site:           (auto-detect)"
+        Write-Host "  Frappe Site Dir:        (auto-detect)"
     }
     Write-Host "  Contact Email:          $ContactEmail"
     Write-Host "  Let's Encrypt env:      $(if ($UseStaging) { 'STAGING (test certs)' } else { 'PRODUCTION (trusted certs)' })"
@@ -480,7 +533,7 @@ try {
     # ---- Step 2: Grant DNS Zone Contributor on the zone ----
     Write-LogMessage 'Step 2/7: DNS Zone Contributor role assignment' -Level Info
     $existingAssignment = Get-AzRoleAssignment -ObjectId $mi.PrincipalId `
-        -Scope $dnsZone.Id -RoleDefinitionName 'DNS Zone Contributor' -ErrorAction SilentlyContinue
+        -Scope $dnsZoneResourceId -RoleDefinitionName 'DNS Zone Contributor' -ErrorAction SilentlyContinue
     if ($existingAssignment) {
         Write-LogMessage "  Role assignment already exists. Skipping." -Level Info
     } else {
@@ -494,7 +547,7 @@ try {
                 try {
                     New-AzRoleAssignment -ObjectId $mi.PrincipalId `
                         -RoleDefinitionName 'DNS Zone Contributor' `
-                        -Scope $dnsZone.Id -ErrorAction Stop | Out-Null
+                        -Scope $dnsZoneResourceId -ErrorAction Stop | Out-Null
                     $success = $true
                     Write-LogMessage "  Granted DNS Zone Contributor on $PublicZoneName" -Level Success
                 } catch {
@@ -543,19 +596,37 @@ try {
 
     # ---- Step 4: Install certbot and certbot-dns-azure on the VM ----
     Write-LogMessage 'Step 4/7: Installing certbot and certbot-dns-azure on VM' -Level Info
+    # IMPORTANT - DEPENDENCY VERSION PINS (discovered through real testing 2026-05-17):
+    #
+    #   1. pyopenssl<26:
+    #      pyOpenSSL 26.0.0+ removed the deprecated OpenSSL.crypto.X509Extension
+    #      class. The certbot 'acme' library still references it. Without the
+    #      pin, certbot fails on first invocation with:
+    #        AttributeError: module 'OpenSSL.crypto' has no attribute 'X509Extension'
+    #      Reference: https://github.com/certbot/certbot/issues/9828
+    #
+    #   2. azure-mgmt-dns==8.2.0:
+    #      Released July 2025, azure-mgmt-dns 9.0.0 changed the constructor
+    #      signature for DnsManagementClient. The certbot-dns-azure plugin
+    #      hasn't been updated, so any DNS-01 challenge fails with:
+    #        TypeError: DnsManagementClient.__init__() takes from 3 to 4
+    #          positional arguments but 5 were given
+    #      Reference: https://github.com/certbot/certbot/issues/10367
+    #
+    # Both pins should be removed (and tested!) when upstream certbot/plugin
+    # versions are updated to support the newer libraries.
     $installScript = @'
-#!/bin/bash
-set -e
-
-# Check if already installed
-if command -v certbot >/dev/null 2>&1 && python3 -c "import certbot_dns_azure" 2>/dev/null; then
-    echo "certbot and certbot-dns-azure already installed."
-    certbot --version
-    exit 0
+# Idempotent: skip if certbot is already installed AND working.
+if command -v certbot >/dev/null 2>&1 && certbot --version >/dev/null 2>&1; then
+    if python3 -c "import certbot_dns_azure" 2>/dev/null; then
+        echo "certbot and certbot-dns-azure already installed and working."
+        certbot --version
+        exit 0
+    fi
 fi
 
-# Install via the official certbot snap or pip. We use pip in a venv to avoid
-# PEP 668 issues on Ubuntu 24.04 (which restricts system-wide pip installs).
+# Install build prerequisites. We use pip in a venv at /opt/certbot to avoid
+# PEP 668 restrictions on system-wide pip installs (Ubuntu 24.04 default).
 apt-get update -qq
 apt-get install -y -qq python3 python3-venv libaugeas0
 
@@ -564,22 +635,36 @@ if [ ! -d /opt/certbot ]; then
     python3 -m venv /opt/certbot
 fi
 
-# Upgrade pip and install certbot + the Azure DNS plugin
+# Upgrade pip in the venv first
 /opt/certbot/bin/pip install --upgrade --quiet pip
-/opt/certbot/bin/pip install --quiet certbot certbot-dns-azure
 
-# Make certbot available on PATH
+# Install certbot, the Azure DNS plugin, and the pinned dependencies.
+# The version pins (pyopenssl<26 and azure-mgmt-dns==8.2.0) are CRITICAL.
+# See the PowerShell comment block above for why these specific versions.
+/opt/certbot/bin/pip install --quiet \
+    certbot \
+    certbot-dns-azure \
+    'pyopenssl<26' \
+    'azure-mgmt-dns==8.2.0'
+
+# Symlink the certbot binary onto PATH so the rest of the script can find it
 ln -sf /opt/certbot/bin/certbot /usr/local/bin/certbot
 
-echo "Installation complete:"
+# Smoke-test the install: certbot --version must succeed.
+# If pyopenssl or azure-mgmt-dns pins were wrong, this would throw a traceback.
+echo "Verifying install:"
 certbot --version
 /opt/certbot/bin/pip show certbot-dns-azure | grep -E "^(Name|Version):"
+/opt/certbot/bin/pip show pyopenssl | grep -E "^(Name|Version):"
+/opt/certbot/bin/pip show azure-mgmt-dns | grep -E "^(Name|Version):"
 '@
 
-    if ($PSCmdlet.ShouldProcess($ERPNextVMName, 'Install certbot + certbot-dns-azure')) {
+    if ($PSCmdlet.ShouldProcess($ERPNextVMName, 'Install certbot + certbot-dns-azure (with version pins)')) {
         $result = Invoke-VMScript -VMName $ERPNextVMName -ResourceGroup $ERPNextVMResourceGroup `
             -ScriptText $installScript -Description 'install certbot and certbot-dns-azure plugin'
-        Write-LogMessage "  certbot installation: $($result.StdOut -split "`n" | Select-Object -Last 5 | Out-String)" -Level Info
+        Write-LogMessage "  certbot install verified. Tail of output:" -Level Success
+        $tail = ($result.StdOut -split "`n" | Select-Object -Last 8) -join "`n"
+        Write-LogMessage "$tail" -Level Debug
     }
 
     # ---- Step 5: Configure certbot with managed identity + run certificate request ----
@@ -591,7 +676,8 @@ certbot --version
     # - which UAMI client ID to use (we pass it explicitly so the plugin picks
     #   the right one if the VM has multiple UAMIs attached)
     # - which DNS zone(s) to write TXT records into, and where they live
-    $dnsZoneResourceId = $dnsZone.Id
+    # ($dnsZoneResourceId was constructed at pre-flight, since Get-AzDnsZone's
+    # return object doesn't expose an Id property directly.)
     $miClientId = $mi.ClientId
 
     $iniContent = @"
@@ -671,115 +757,211 @@ ls -la /etc/letsencrypt/live/$PublicZoneName/
         $result = Invoke-VMScript -VMName $ERPNextVMName -ResourceGroup $ERPNextVMResourceGroup `
             -ScriptText $certRequestScript -Description 'request wildcard cert'
 
-        # Look for clear success markers in stdout
+        # Invoke-VMScript already threw if the sentinel wasn't seen, so reaching
+        # this code means the script completed. Confirm cert files are present
+        # in the output as a secondary sanity check.
         if ($result.StdOut -match 'Successfully received certificate' -or `
-            $result.StdOut -match 'Certificate files:' -or `
             $result.StdOut -match 'fullchain\.pem') {
             Write-LogMessage "  Certificate issued successfully." -Level Success
         } else {
-            Write-LogMessage "  Certificate request did not produce expected success markers." -Level Warning
-            Write-LogMessage "  Review the log for details. STDOUT/STDERR captured." -Level Warning
-            # Don't throw - operator can review
+            # Sentinel passed but no cert markers - unusual, surface it.
+            Write-LogMessage "  Script completed but expected cert markers not seen. Verify /etc/letsencrypt/live/$PublicZoneName/ exists on the VM." -Level Warning
         }
     }
 
     # ---- Step 6: Wire cert into ERPNext via site_config.json + bench setup nginx ----
     Write-LogMessage 'Step 6/7: Configuring ERPNext to use the certificate' -Level Info
 
-    # If site name wasn't provided, detect it from the sites directory.
-    if (-not $SiteName) {
-        Write-LogMessage "  Auto-detecting ERPNext site name..." -Level Info
+    # If FrappeSiteDir wasn't provided, detect it. Note this is the INTERNAL
+    # Frappe site name (e.g., 'jtcustomtrailers.local'), which is typically
+    # DIFFERENT from the public FQDN (e.g., 'erpnext.awesomewildstuff.com').
+    # The auto-detect looks for the single non-asset directory under sites/.
+    if (-not $FrappeSiteDir) {
+        Write-LogMessage "  Auto-detecting Frappe site directory..." -Level Info
+        # The detect script must end with `find -print` output that gives one
+        # site directory name. We intentionally skip 'assets', 'apps.txt', and
+        # JSON config files at the sites/ root.
         $detectScript = @"
-#!/bin/bash
-set -e
-# List directories in the sites folder. Skip 'assets' (Frappe internal).
-ls -1 $FrappeBenchPath/sites/ 2>/dev/null | grep -v '^assets$' | grep -v '^apps\.txt$' | grep -v '^common_site_config\.json$' | head -1
+SITES_DIR='$FrappeBenchPath/sites'
+if [ ! -d "`$SITES_DIR" ]; then
+    echo "ERROR: Frappe bench sites directory not found at `$SITES_DIR" >&2
+    exit 1
+fi
+# List directories only, excluding the special 'assets' directory.
+DETECTED=`$(find "`$SITES_DIR" -mindepth 1 -maxdepth 1 -type d -not -name 'assets' -printf '%f\n' | head -1)
+if [ -z "`$DETECTED" ]; then
+    echo "ERROR: No Frappe site directories found under `$SITES_DIR" >&2
+    exit 1
+fi
+echo "DETECTED_SITE=`$DETECTED"
 "@
         $result = Invoke-VMScript -VMName $ERPNextVMName -ResourceGroup $ERPNextVMResourceGroup `
-            -ScriptText $detectScript -Description 'detect ERPNext site name'
-        $SiteName = ($result.StdOut -split "`n" | Where-Object { $_ -and $_ -notmatch '^\s*$' } | Select-Object -First 1).Trim()
-        if (-not $SiteName) {
-            throw "Could not auto-detect ERPNext site name in $FrappeBenchPath/sites/. Specify with -SiteName explicitly."
+            -ScriptText $detectScript -Description 'detect Frappe site directory'
+        # Parse out the DETECTED_SITE= line
+        $detectLine = ($result.StdOut -split "`n" | Where-Object { $_ -match '^DETECTED_SITE=' } | Select-Object -First 1)
+        if (-not $detectLine) {
+            throw "Could not auto-detect Frappe site directory under $FrappeBenchPath/sites/. Specify with -FrappeSiteDir explicitly."
         }
-        Write-LogMessage "  Detected site: $SiteName" -Level Success
+        $FrappeSiteDir = ($detectLine -replace '^DETECTED_SITE=', '').Trim()
+        Write-LogMessage "  Detected Frappe site directory: $FrappeSiteDir" -Level Success
     }
 
-    # The bench needs to be configured to use the certificate. We:
-    #   1. Read the existing site_config.json
-    #   2. Add/update ssl_certificate and ssl_certificate_key keys
-    #   3. Write it back
-    #   4. Run `bench setup nginx` (as the frappe user) to regenerate config
-    #   5. Reload nginx
-    #
-    # Note: bench commands must be run as the frappe admin user (not root),
-    # from within the bench directory. We use `sudo -u <user> -H ...` for that.
-
+    # Now the big ERPNext config block. This handles FOUR discoveries that
+    # are hard to find documented anywhere in one place. See block comments
+    # below for context on each one.
     $configScript = @"
-#!/bin/bash
-set -e
-
-SITE_CONFIG='$FrappeBenchPath/sites/$SiteName/site_config.json'
+SITE_CONFIG='$FrappeBenchPath/sites/$FrappeSiteDir/site_config.json'
 CERT_PATH='/etc/letsencrypt/live/$PublicZoneName/fullchain.pem'
 KEY_PATH='/etc/letsencrypt/live/$PublicZoneName/privkey.pem'
 
 if [ ! -f "`$SITE_CONFIG" ]; then
-    echo "ERROR: site_config.json not found at `$SITE_CONFIG"
+    echo "ERROR: site_config.json not found at `$SITE_CONFIG" >&2
     exit 1
 fi
 
 if [ ! -f "`$CERT_PATH" ]; then
-    echo "ERROR: Certificate not found at `$CERT_PATH"
+    echo "ERROR: Certificate not found at `$CERT_PATH" >&2
     exit 1
 fi
 
-# Ensure the Frappe user can read the cert files. By default Let's Encrypt
-# locks them down to root:root 0700 on the live/ dirs. Frappe needs read.
-# We adjust the /etc/letsencrypt/live and archive dir permissions so the
-# frappe user can traverse them. This is safe: the keys are still chmod 600,
-# only root and the configured Frappe user can read them.
+# ============================================================================
+# DISCOVERY 1: Frappe user needs read access to the cert files
+# ============================================================================
+# By default Let's Encrypt locks /etc/letsencrypt/live/<zone> and the
+# /etc/letsencrypt/archive/<zone> dirs to root:root 0700. nginx running as
+# the Frappe user can't read the cert files. We use POSIX ACLs to grant
+# the Frappe user read access without changing ownership. setfacl gracefully
+# handles the case where the archive dir doesn't have all expected files.
+# ============================================================================
+if ! command -v setfacl >/dev/null 2>&1; then
+    apt-get install -y -qq acl
+fi
 chmod 755 /etc/letsencrypt/live /etc/letsencrypt/archive
 setfacl -m u:$FrappeAdminUser`:rx /etc/letsencrypt/live/$PublicZoneName 2>/dev/null || true
 setfacl -m u:$FrappeAdminUser`:r /etc/letsencrypt/live/$PublicZoneName/* 2>/dev/null || true
 setfacl -m u:$FrappeAdminUser`:rx /etc/letsencrypt/archive/$PublicZoneName 2>/dev/null || true
 setfacl -m u:$FrappeAdminUser`:r /etc/letsencrypt/archive/$PublicZoneName/* 2>/dev/null || true
 
-# Update site_config.json using jq (install if missing)
+# ============================================================================
+# DISCOVERY 2: site_config.json needs host_name, domains, AND ssl_certificate
+# ============================================================================
+# Frappe routes incoming requests by matching the Host header. For SSL to
+# work, the site_config.json must contain ALL FOUR of these keys:
+#   - ssl_certificate    : path to the fullchain.pem
+#   - ssl_certificate_key: path to the privkey.pem
+#   - host_name          : the public FQDN (used in nginx server_name)
+#   - domains            : array of FQDNs that should map to this site
+# Without host_name and domains, Frappe generates nginx config with
+# server_name set to the internal site dir name, which won't match the
+# public hostname users type in their browser.
+# ============================================================================
 if ! command -v jq >/dev/null 2>&1; then
     apt-get install -y -qq jq
 fi
-
-# Add/update ssl_certificate and ssl_certificate_key keys.
-# jq's --arg flag handles escaping properly.
 TMPFILE=`$(mktemp)
-jq --arg cert "`$CERT_PATH" --arg key "`$KEY_PATH" \
-   '. + {ssl_certificate: `$cert, ssl_certificate_key: `$key}' \
+# Merge new keys preserving existing config (jq's + operator is right-biased)
+jq --arg cert "`$CERT_PATH" \
+   --arg key "`$KEY_PATH" \
+   --arg host "$PublicFQDN" \
+   '. + {ssl_certificate: `$cert, ssl_certificate_key: `$key, host_name: `$host}
+    + (if (.domains // [] | index(`$host)) then {} else {domains: ((.domains // []) + [`$host])} end)' \
    "`$SITE_CONFIG" > "`$TMPFILE"
 mv "`$TMPFILE" "`$SITE_CONFIG"
 chown $FrappeAdminUser`:$FrappeAdminUser "`$SITE_CONFIG"
-
 echo "Updated site_config.json:"
 cat "`$SITE_CONFIG"
 echo ""
 
-# Run bench setup nginx as the Frappe user (must NOT be run as root).
-# This regenerates /etc/nginx/conf.d/frappe-bench.conf with SSL.
-sudo -u $FrappeAdminUser -H bash -c "cd $FrappeBenchPath && bench setup nginx --yes"
+# ============================================================================
+# DISCOVERY 3: Frappe needs dns_multitenant mode enabled to generate SSL
+# ============================================================================
+# By default, Frappe runs in PORT-based multitenancy: each site gets a
+# unique port number, and there's a single nginx server block per site
+# listening on that port. In this mode, Frappe ignores ssl_certificate
+# entirely - no port 443 listener is generated.
+#
+# To get SSL, we must switch to DNS-based multitenancy, where Frappe maps
+# incoming Host headers to sites and generates per-domain server blocks
+# (including SSL listeners on 443 when ssl_certificate is set).
+#
+# 'bench config dns_multitenant on' adds "dns_multitenant": true to
+# common_site_config.json. The change is idempotent.
+# ============================================================================
+sudo -u $FrappeAdminUser -H bash -c "set -e; cd $FrappeBenchPath && bench config dns_multitenant on"
 
+# ============================================================================
+# DISCOVERY 4: nginx.conf needs log_format main defined
+# ============================================================================
+# Frappe's generated nginx config references a log_format named 'main' in
+# its access_log directive. This format is supposed to live in the http
+# block of /etc/nginx/nginx.conf. But Ubuntu's default nginx.conf does NOT
+# define a 'main' format - it defines one named 'combined' (the nginx
+# default). When Frappe regenerates with SSL enabled, nginx -t fails with:
+#   [emerg] unknown log format "main" in /etc/nginx/conf.d/frappe-bench.conf
+#
+# We patch nginx.conf to add the standard 'main' format if it's missing.
+# Done before bench setup nginx so the syntax check passes on first try.
+# ============================================================================
+if ! grep -q "log_format main" /etc/nginx/nginx.conf; then
+    echo "Adding 'main' log_format definition to nginx.conf..."
+    # Use Python for safe in-place edit. The 'main' format is the Apache
+    # combined format with X-Forwarded-For appended.
+    python3 <<'PYEOF'
+import re
+path = '/etc/nginx/nginx.conf'
+with open(path) as f:
+    content = f.read()
+log_fmt = "\tlog_format main '\$remote_addr - \$remote_user [\$time_local] \"\$request\" '\n\t\t\t\t'\$status \$body_bytes_sent \"\$http_referer\" '\n\t\t\t\t'\"\$http_user_agent\" \"\$http_x_forwarded_for\"';\n"
+if 'log_format main' not in content:
+    new_content = re.sub(r'(http\s*\{\n)', r'\1' + log_fmt, content, count=1)
+    with open(path, 'w') as f:
+        f.write(new_content)
+    print("Added log_format main to http block")
+PYEOF
+else
+    echo "log_format main already defined in nginx.conf"
+fi
+
+# Now regenerate the nginx config. With dns_multitenant=true plus
+# ssl_certificate/host_name/domains in site_config, Frappe emits proper
+# 80/443 server blocks with SSL configuration.
+echo ""
+echo "Regenerating nginx config via bench setup nginx..."
+sudo -u $FrappeAdminUser -H bash -c "set -e; cd $FrappeBenchPath && bench setup nginx --yes"
+
+# Test the new config syntax. If this fails the script will exit before
+# we try to reload nginx (set -e at the top).
+echo ""
+echo "Testing nginx config syntax..."
+nginx -t
+
+# Reload nginx so the new config + cert take effect
 echo ""
 echo "Reloading nginx..."
-nginx -t  # syntax check first
 systemctl reload nginx
-echo "nginx reloaded successfully."
+
+# Verify both 80 AND 443 are listening
+echo ""
+echo "Listening ports after reload:"
+ss -tlnp | grep -E ':80|:443' || echo "WARN: no listeners detected"
+
+# Final confirmation marker checked by PowerShell (this is in addition to
+# the sentinel that Invoke-VMScript expects)
+echo ""
+echo "nginx reloaded successfully on ports 80 and 443"
 "@
 
-    if ($PSCmdlet.ShouldProcess($SiteName, 'Configure ERPNext site for SSL')) {
+    if ($PSCmdlet.ShouldProcess($FrappeSiteDir, 'Configure ERPNext site for SSL')) {
         $result = Invoke-VMScript -VMName $ERPNextVMName -ResourceGroup $ERPNextVMResourceGroup `
             -ScriptText $configScript -Description 'configure site_config.json and regenerate nginx'
 
-        if ($result.StdOut -match 'nginx reloaded successfully') {
-            Write-LogMessage "  ERPNext + nginx configured for SSL." -Level Success
+        # Verify both ports are listening in the output. The sentinel in
+        # Invoke-VMScript already confirmed the script completed - this is
+        # the higher-level "actually working" check.
+        if ($result.StdOut -match ':443' -and $result.StdOut -match ':80') {
+            Write-LogMessage "  ERPNext + nginx configured for SSL. Ports 80 and 443 listening." -Level Success
         } else {
-            Write-LogMessage "  ERPNext SSL configuration completed but no success marker. Verify nginx status." -Level Warning
+            Write-LogMessage "  Script completed but ports 80/443 not both confirmed in output. Verify manually." -Level Warning
         }
     }
 
@@ -861,7 +1043,8 @@ systemctl list-timers certbot-renew.timer --no-pager
     Write-Host "  Managed Identity:   $ManagedIdentityName"
     Write-Host "  Cert Domain:        *.$PublicZoneName, $PublicZoneName"
     Write-Host "  Cert Location:      /etc/letsencrypt/live/$PublicZoneName/"
-    Write-Host "  ERPNext Site:       $SiteName"
+    Write-Host "  Public FQDN:        $PublicFQDN"
+    Write-Host "  Frappe Site Dir:    $FrappeSiteDir"
     Write-Host "  Let's Encrypt env:  $(if ($UseStaging) { 'STAGING (untrusted)' } else { 'PRODUCTION (trusted)' })"
     Write-Host "  Auto Renewal:       systemd timer, twice daily"
     Write-Host ''
@@ -870,11 +1053,11 @@ systemctl list-timers certbot-renew.timer --no-pager
     Write-Host '---------------------------------------------------------------' -ForegroundColor Yellow
     Write-Host ''
     Write-Host '1. Browser test (from your VPN-connected laptop):'
-    Write-Host "     https://$SiteName"
+    Write-Host "     https://$PublicFQDN"
     Write-Host '   Should load ERPNext with a green padlock (no cert warning).'
     Write-Host ''
     Write-Host '2. Cert inspection:'
-    Write-Host "     openssl s_client -connect ${SiteName}:443 -servername $SiteName <<< 'Q' | openssl x509 -noout -dates -subject"
+    Write-Host "     openssl s_client -connect ${PublicFQDN}:443 -servername $PublicFQDN <<< 'Q' | openssl x509 -noout -dates -subject"
     Write-Host '   (Run this from anywhere - the cert chain is publicly trusted)'
     Write-Host ''
     Write-Host '3. Verify renewal timer (SSH to the ERPNext VM):'
@@ -901,7 +1084,8 @@ systemctl list-timers certbot-renew.timer --no-pager
         ManagedIdentityName     = $ManagedIdentityName
         ManagedIdentityClientId = $mi.ClientId
         ERPNextVMName           = $ERPNextVMName
-        ERPNextSite             = $SiteName
+        PublicFQDN              = $PublicFQDN
+        FrappeSiteDir           = $FrappeSiteDir
         CertDomain              = "*.$PublicZoneName"
         CertLocation            = "/etc/letsencrypt/live/$PublicZoneName/"
         UsedStaging             = $UseStaging.IsPresent
