@@ -15,6 +15,7 @@ End-to-end PowerShell automation for deploying [ERPNext](https://erpnext.com/) o
 |---|---|
 | **Deploy-ERPNextToAzure.ps1** | Provisions an Azure VM and installs ERPNext end-to-end |
 | **Remove-ERPNextAzureDeployment.ps1** | Tears down resources for clean re-testing |
+| **Add-LetsEncryptSSL.ps1** | Adds Let's Encrypt wildcard SSL via DNS-01 + managed identity |
 | **Import-ERPNextCategories.ps1** | Imports WooCommerce category hierarchy into ERPNext Item Groups |
 | **Select-AzureContext.ps1** | Helper for switching Azure contexts across tenants/subscriptions |
 | **Quick-Start-Guide.md** | Step-by-step deployment walkthrough |
@@ -42,6 +43,8 @@ End-to-end PowerShell automation for deploying [ERPNext](https://erpnext.com/) o
 The script is **idempotent** — safe to re-run after a partial failure. Resources that already exist are detected and skipped.
 
 **`Import-ERPNextCategories.ps1`** reads a WooCommerce category export (Excel) and creates the matching Item Group hierarchy in ERPNext via REST API, preserving parent-child relationships and setting the `is_group` flag based on the actual presence of children.
+
+**`Add-LetsEncryptSSL.ps1`** adds production-grade SSL to a deployed ERPNext instance using a Let's Encrypt wildcard certificate. Because the typical Azure Innovators deployment puts ERPNext on a private IP behind a VPN (not the public internet), HTTP-01 challenges aren't viable. The script uses the DNS-01 challenge with Azure DNS, authenticated via a User-Assigned Managed Identity attached to the ERPNext VM — no service principal secrets to manage. After provisioning the cert, the script configures Frappe's `site_config.json`, regenerates nginx, and installs a systemd timer for automatic twice-daily renewal checks. Run it once after the initial deployment.
 
 **`Remove-ERPNextAzureDeployment.ps1`** tears down what the deploy script created so you can re-test from a clean slate. It handles two modes (whole-RG nuke or selective per-resource), detects and optionally removes resource locks, deals correctly with Key Vault soft-delete (including the optional purge step to free the vault name immediately), and can clean up local artifacts (connection-info JSON, generated install script, log files).
 
@@ -74,6 +77,15 @@ Connect-AzAccount
     -AllowedSourceCIDR '203.0.113.42/32' `
     -UseSSHKey -SSHPublicKeyPath "$HOME/.ssh/id_rsa.pub" `
     -UseKeyVault -KeyVaultName 'JTC-prod-kv-eastus'
+
+# 4. (Optional) Add Let's Encrypt SSL after deployment
+.\Add-LetsEncryptSSL.ps1 -ConfirmContext `
+    -ERPNextVMName 'JTC-prod-erpnext-eastus-vm' `
+    -ERPNextVMResourceGroup 'JTC-prod-erpnext-eastus-rg' `
+    -PublicZoneName 'contoso.com' `
+    -PublicZoneResourceGroup 'contoso-dns-rg' `
+    -PublicFQDN 'erpnext.contoso.com' `
+    -ContactEmail 'admin@contoso.com'
 ```
 
 Full walkthrough: [Quick-Start-Guide.md](Quick-Start-Guide.md).
@@ -112,6 +124,53 @@ Full walkthrough: [Quick-Start-Guide.md](Quick-Start-Guide.md).
 | `-DryRun` | off | Print plan without making changes |
 | `-ThrottleMilliseconds` | `100` | Delay between API calls |
 | `-SkipSSLValidation` | off | Self-signed cert support |
+
+### `Add-LetsEncryptSSL.ps1`
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `-ERPNextVMName` | (required) | Name of the ERPNext VM to add SSL to |
+| `-ERPNextVMResourceGroup` | (required) | RG containing the ERPNext VM |
+| `-PublicZoneName` | (required) | Public DNS zone in Azure DNS (e.g., `contoso.com`) |
+| `-PublicZoneResourceGroup` | (required) | RG containing the public DNS zone |
+| `-ContactEmail` | (required) | Email Let's Encrypt associates with the account |
+| `-PublicFQDN` | (required) | Public hostname users will type (e.g., `erpnext.contoso.com`) |
+| `-FrappeSiteDir` | auto-detect | Frappe site directory under `frappe-bench/sites/` (often differs from FQDN) |
+| `-FrappeAdminUser` | `jtadmin` | Linux user that owns `frappe-bench` |
+| `-FrappeBenchPath` | `/home/<user>/frappe-bench` | Override if your install is elsewhere |
+| `-ManagedIdentityName` | derived | Name for the auto-created User-Assigned Managed Identity |
+| `-ManagedIdentityResourceGroup` | = ERPNextVMResourceGroup | RG for the managed identity |
+| `-UseStaging` | off | Use Let's Encrypt staging (untrusted certs, no rate limits) |
+| `-ForceRenewal` | off | Force re-issue of existing certificate |
+| `-NamePrefix` | derived from VM | Prefix for derived resource names |
+| `-ConfirmContext` | off | Multi-tenant safety bypass |
+| `-TenantId`, `-SubscriptionId` | current | Override Azure context |
+
+**Common SSL provisioning flow:**
+
+```powershell
+# Step 1: Test with Let's Encrypt staging first (avoids burning prod rate limits)
+.\Add-LetsEncryptSSL.ps1 -ConfirmContext `
+    -ERPNextVMName 'JTC-prod-erpnext-westus2-vm' `
+    -ERPNextVMResourceGroup 'JTC-prod-erpnext-westus2-rg' `
+    -PublicZoneName 'awesomewildstuff.com' `
+    -PublicZoneResourceGroup 'AWS-Prod-EastUS-rg' `
+    -PublicFQDN 'erpnext.awesomewildstuff.com' `
+    -FrappeSiteDir 'jtcustomtrailers.local' `
+    -ContactEmail 'admin@awesomewildstuff.com' `
+    -UseStaging
+
+# Step 2: Once verified, re-run for a real production cert
+# (drop -UseStaging; the script will detect existing identity and just re-issue)
+.\Add-LetsEncryptSSL.ps1 -ConfirmContext `
+    -ERPNextVMName 'JTC-prod-erpnext-westus2-vm' `
+    -ERPNextVMResourceGroup 'JTC-prod-erpnext-westus2-rg' `
+    -PublicZoneName 'awesomewildstuff.com' `
+    -PublicZoneResourceGroup 'AWS-Prod-EastUS-rg' `
+    -PublicFQDN 'erpnext.awesomewildstuff.com' `
+    -FrappeSiteDir 'jtcustomtrailers.local' `
+    -ContactEmail 'admin@awesomewildstuff.com'
+```
 
 ### `Remove-ERPNextAzureDeployment.ps1`
 
@@ -227,6 +286,7 @@ If you're a consultant or MSP engineer with access to multiple Azure tenants and
 - **Default authentication is password.** Use `-UseSSHKey` for production.
 - **Default secret storage is a local JSON file.** Use `-UseKeyVault` to keep secrets in Azure Key Vault.
 - **Key Vault requires role-assignment rights.** When `-UseKeyVault` is used, the running identity needs **Owner** or **User Access Administrator** on the Resource Group (not just Contributor) so the script can grant itself the *Key Vault Secrets Officer* role on the vault for data-plane access. The script detects insufficient permissions and provides clear remediation steps if this is missing.
+- **Default access is HTTP only (no TLS).** For any non-throwaway deployment, run `Add-LetsEncryptSSL.ps1` after the initial install. The script provisions a Let's Encrypt wildcard cert via DNS-01 challenge (works behind a VPN where HTTP-01 isn't viable), configures Frappe's `site_config.json`, regenerates nginx, and installs a systemd timer for automatic renewal. Authentication to Azure DNS uses a User-Assigned Managed Identity scoped to the zone — no service principal secrets to manage.
 - The generated install script writes its log to `/var/log/erpnext-install.log` on the VM.
 - Default ERPNext admin user is `Administrator`. Change the password on first login and create per-user accounts for daily work.
 

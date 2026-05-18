@@ -142,6 +142,83 @@ $pw | Set-Clipboard
 
 **IMPORTANT:** Change the Administrator password immediately on first login (in ERPNext: My Settings → Change Password).
 
+### Step 2.5: Add Let's Encrypt SSL (10 minutes — optional but recommended)
+
+At this point you can log into ERPNext over plain HTTP at the VM's private IP. That works, but two reasons to upgrade to HTTPS at a proper hostname before going further:
+
+1. **Browsers warn loudly about plain HTTP for form input.** Once you start configuring real user accounts and entering data, the "Not Secure" banner gets old fast.
+2. **Bookmarks and integrations should point at a stable hostname**, not a private IP that could change if the VM is rebuilt.
+
+The `Add-LetsEncryptSSL.ps1` script handles end-to-end SSL provisioning using a Let's Encrypt wildcard cert obtained via DNS-01 challenge. Because the ERPNext VM has no public IP (it's reached over VPN), HTTP-01 challenges won't work — but DNS-01 only needs the ability to write TXT records into your public DNS zone, which the script automates via a User-Assigned Managed Identity.
+
+**Prerequisites for this step:**
+
+- A **public DNS zone** for your domain hosted in Azure DNS (e.g., `awesomewildstuff.com` in resource group `AWS-Prod-EastUS-rg`)
+- **VPN access to the ERPNext VM** for browser verification at the end (the script itself runs over Azure Run Command and doesn't need VPN)
+- VPN-connected clients need a way to resolve your public FQDN to the VM's private IP — split-horizon DNS + a DNS forwarder. The [Setup-AzureP2SVPN repo](https://github.com/JONeillSr/Setup-AzureP2SVPN) has `Add-AzureSplitHorizonDNS.ps1` and `Add-AzureDNSForwarder.ps1` that handle this.
+
+**The two-pass flow (recommended):**
+
+```powershell
+# Pass 1: Test with Let's Encrypt staging (no rate limits, untrusted cert, easy reset)
+.\Add-LetsEncryptSSL.ps1 -ConfirmContext `
+    -ERPNextVMName 'JTC-prod-erpnext-westus2-vm' `
+    -ERPNextVMResourceGroup 'JTC-prod-erpnext-westus2-rg' `
+    -PublicZoneName 'awesomewildstuff.com' `
+    -PublicZoneResourceGroup 'AWS-Prod-EastUS-rg' `
+    -PublicFQDN 'erpnext.awesomewildstuff.com' `
+    -FrappeSiteDir 'jtcustomtrailers.local' `
+    -ContactEmail 'admin@awesomewildstuff.com' `
+    -UseStaging
+```
+
+After this completes, browse to `https://erpnext.awesomewildstuff.com` over VPN. You'll see a certificate warning because staging certs aren't publicly trusted — that's expected. Click through and you should see the ERPNext login screen served over HTTPS.
+
+If everything looks right:
+
+```powershell
+# Pass 2: Re-run for a real, publicly-trusted production cert
+.\Add-LetsEncryptSSL.ps1 -ConfirmContext `
+    -ERPNextVMName 'JTC-prod-erpnext-westus2-vm' `
+    -ERPNextVMResourceGroup 'JTC-prod-erpnext-westus2-rg' `
+    -PublicZoneName 'awesomewildstuff.com' `
+    -PublicZoneResourceGroup 'AWS-Prod-EastUS-rg' `
+    -PublicFQDN 'erpnext.awesomewildstuff.com' `
+    -FrappeSiteDir 'jtcustomtrailers.local' `
+    -ContactEmail 'admin@awesomewildstuff.com'
+```
+
+The script detects the existing managed identity and just re-issues the cert against Let's Encrypt's production endpoint. After this completes, browse to `https://erpnext.awesomewildstuff.com` again — **green padlock, no warning**.
+
+**What the script does (high level):**
+
+1. Creates a User-Assigned Managed Identity in your subscription, attached to the ERPNext VM
+2. Grants the identity **DNS Zone Contributor** on the public DNS zone (least privilege — only the specific zone, not the whole RG)
+3. Installs certbot + the certbot-dns-azure plugin into a venv at `/opt/certbot` on the VM
+4. Requests a wildcard cert for `*.<zone>` and `<zone>`
+5. Updates `site_config.json` with the cert paths plus `host_name` and `domains` arrays
+6. Switches Frappe to `dns_multitenant` mode (required for SSL listener generation)
+7. Patches `/etc/nginx/nginx.conf` to define the `log_format main` that Frappe's generated config references
+8. Runs `bench setup nginx --yes` to regenerate the nginx config with SSL listeners
+9. Reloads nginx
+10. Installs a systemd timer + deploy hook for automatic twice-daily renewal checks
+
+The script is idempotent — safe to re-run if interrupted, and the renewal timer takes care of the cert lifecycle from this point on (90-day validity, auto-renewed at 60 days).
+
+**Verification after Step 2.5:**
+
+```powershell
+# From your VPN-connected laptop:
+Resolve-DnsName erpnext.awesomewildstuff.com
+# Should return the private IP (e.g., 10.0.2.4)
+
+# Browser test:
+Start-Process 'https://erpnext.awesomewildstuff.com'
+# Should load ERPNext login with green padlock - no warning, no fuss
+```
+
+If `Resolve-DnsName` returns the public IP or NXDOMAIN, that's a DNS issue — confirm split-horizon DNS + forwarder are set up (see the [Setup-AzureP2SVPN USER-GUIDE](https://github.com/JONeillSr/Setup-AzureP2SVPN/blob/main/USER-GUIDE.md#dns-for-vpn-clients)).
+
 ### Step 3: Initial ERPNext Configuration (15 minutes)
 
 1. **Company Setup Wizard:**
@@ -378,7 +455,7 @@ See **WooCommerce-Integration-Guide.md** § Troubleshooting. Common: API credent
 **Within the first week:**
 
 - Set up automated daily backups to Azure Blob Storage
-- Configure SSL — even over private VNet, encryption-in-transit is good practice
+- **Configure SSL via `Add-LetsEncryptSSL.ps1`** — even over private VNet, encryption-in-transit is good practice; see Step 2.5 above for the full flow
 - Consider Azure Backup for the VM (snapshots + retention)
 
 **Ongoing:**

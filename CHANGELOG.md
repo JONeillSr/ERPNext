@@ -6,6 +6,75 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.7.0] - 2026-05-18
+
+### Added
+
+- **`Add-LetsEncryptSSL.ps1` (v1.0.2)** — A standalone companion script that adds production-grade SSL to an ERPNext-on-Azure deployment using Let's Encrypt wildcard certificates obtained via DNS-01 challenge against Azure DNS.
+
+  The architecture is opinionated for the typical Azure Innovators / SMB-consulting scenario: the ERPNext VM is reachable only via VPN (not the public internet), so HTTP-01 challenges are impossible — DNS-01 is the only viable path. Authentication to the Azure DNS API uses a **User-Assigned Managed Identity** attached to the ERPNext VM, with **DNS Zone Contributor** granted at the zone level only (least privilege). No service principal secrets to manage, no client IDs to rotate.
+
+  After provisioning, the script:
+  - Installs certbot and the certbot-dns-azure plugin into a venv at `/opt/certbot` (avoids Ubuntu 24.04's PEP 668 system-pip restriction)
+  - Configures certbot to use the managed identity for Azure DNS API authentication
+  - Requests a wildcard cert covering `*.<zone>` and `<zone>`
+  - Updates the ERPNext site's `site_config.json` with `ssl_certificate`, `ssl_certificate_key`, `host_name`, and `domains`
+  - Regenerates the nginx config via `bench setup nginx --yes`
+  - Sets up a systemd timer for twice-daily renewal checks
+  - Configures a deploy hook to reload nginx after each successful renewal
+
+### Four ERPNext-on-Ubuntu gotchas the script handles
+
+In the course of testing this end-to-end against a real deployment, four issues surfaced that aren't documented in any single place online. The script bakes in the workarounds with explanatory comments so future maintainers know what each workaround protects against:
+
+1. **`pyopenssl<26` version pin.** As of late 2025, pyOpenSSL 26.0.0+ removed the deprecated `OpenSSL.crypto.X509Extension` class. The certbot `acme` library still references it. Without the pin, `certbot --version` throws `AttributeError: module 'OpenSSL.crypto' has no attribute 'X509Extension'` on the very first invocation.
+
+2. **`azure-mgmt-dns==8.2.0` version pin.** A breaking constructor change in `azure-mgmt-dns` 9.0.0 (released mid-2025) is incompatible with the current `certbot-dns-azure` plugin. Without the pin, certbot raises `TypeError: DnsManagementClient.__init__() takes from 3 to 4 positional arguments but 5 were given` during the DNS challenge.
+
+3. **`log_format main` patch to `/etc/nginx/nginx.conf`.** Frappe's generated nginx config references a log_format named `main` in its `access_log` directive, but Ubuntu's default `nginx.conf` only defines `combined`. After regenerating with SSL enabled, `nginx -t` fails with `[emerg] unknown log format "main"`. The script idempotently patches `nginx.conf` to add the standard `main` format if it's missing.
+
+4. **`bench config dns_multitenant on` required.** Frappe runs in port-based multitenancy by default, which silently ignores `ssl_certificate` config entirely — no port 443 listener is generated regardless of what's in `site_config.json`. Switching to DNS-based multitenancy (one server block per domain) is required for Frappe to emit SSL listeners at all.
+
+### Sentinel-based VM script success detection
+
+Beyond the four discoveries above, the script's helper for executing bash on the VM (`Invoke-VMScript`) uses **sentinel-based success detection**. Every bash block sent to the VM is automatically prefixed with `set -e` and suffixed with `echo '__STEP_OK__'`. If that exact marker isn't in stdout after the run, the PowerShell side throws with the full stdout/stderr captured. This replaces the previous pattern of string-matching stderr for words like "Error" and gracefully handles all the failure modes we hit during development:
+
+- bash script aborts on first `set -e` failure before producing stderr
+- script runs successfully but tools printed warnings that matched "Error" (false positives)
+- script runs partially, then exits cleanly without finishing (silent partial failure)
+
+No more "DEPLOYMENT COMPLETE" reports while actually nothing happened on the VM.
+
+### Parameters renamed (breaking change vs. v1.0.0 of the script, but v1.0.0 was never released)
+
+Two parameters that were combined into a single `-SiteName` in early development have been split:
+
+- **`-PublicFQDN`** — The hostname users type in their browser (e.g., `erpnext.contoso.com`). Goes into `site_config.json` as `host_name` and into the `domains` array. This is what nginx serves SSL on.
+- **`-FrappeSiteDir`** — The internal Frappe site directory name (e.g., `jtcustomtrailers.local`). Optional — auto-detected by scanning `frappe-bench/sites/` if not specified.
+
+These are typically DIFFERENT. The Frappe site directory is whatever you chose during initial deployment (often a `.local` placeholder); the public FQDN is what your DNS resolves to the VM's private IP. The split reflects how the underlying tools think about each.
+
+### Cost
+
+Let's Encrypt certs are free. The managed identity is free. DNS API calls during cert renewal are effectively free (a handful of queries every 60-90 days). Total marginal cost: **~$0/month**.
+
+### Documentation
+
+- **Quick-Start-Guide.md**: new "Adding SSL" step in the deployment walkthrough
+- **README.md**: new SSL/HTTPS section with parameter table
+
+### Prerequisites this script DOES NOT solve
+
+To use the Let's Encrypt script, you must already have:
+- A working ERPNext-on-Azure deployment (from `Deploy-ERPNextToAzure.ps1`)
+- A **public DNS zone** for your domain hosted in Azure DNS (Let's Encrypt needs to write TXT records there for the DNS-01 challenge)
+- **VPN access to the ERPNext VM** for browser-based verification (the script itself runs over Azure Run Command and doesn't need VPN)
+- A way for VPN-connected clients to resolve the public FQDN to the VM's private IP — see [Setup-AzureP2SVPN repo](https://github.com/JONeillSr/Setup-AzureP2SVPN) for the split-horizon DNS + forwarder scripts that handle this
+
+The SSL script handles its own piece (certificate provisioning and ERPNext/nginx configuration) and trusts you to have the upstream pieces in place.
+
+---
+
 ## [1.6.5] - 2026-05-16
 
 ### Improved

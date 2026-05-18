@@ -61,4 +61,10 @@ By contributing, you agree that your contributions are licensed under the [MIT L
 
 ## Acknowledgments
 
-This toolkit grew out of real consulting engagements where the manual portal-based ERPNext-on-Azure setup proved tedious enough to automate. Many of the platform quirks the scripts handle (Ubuntu 24.04 PEP 668 restrictions, the need to run `bench setup production` twice, the supervisor group naming on modern Frappe versions) were discovered through trial and error during those deployments. Each fix is documented inline in the scripts so future maintainers can understand what's intentional vs. accidental.
+This toolkit grew out of real consulting engagements where the manual portal-based ERPNext-on-Azure setup proved tedious enough to automate. Many of the platform quirks the scripts handle were discovered through trial and error during those deployments:
+
+- **In the original Deploy script**: Ubuntu 24.04 PEP 668 restrictions on system pip, the need to run `bench setup production` twice, supervisor group naming on modern Frappe versions.
+
+- **In Add-LetsEncryptSSL.ps1**: four discoveries that aren't documented in a single place anywhere — pyOpenSSL 26+ removing `X509Extension`, azure-mgmt-dns 9.0+ breaking certbot-dns-azure, Frappe's generated nginx config referencing an undefined `log_format main`, and Frappe silently ignoring `ssl_certificate` config unless `dns_multitenant` mode is enabled.
+
+Each fix is documented inline in the scripts so future maintainers can understand what's intentional vs. accidental, and so they can confidently remove the workarounds when upstream catches up.
